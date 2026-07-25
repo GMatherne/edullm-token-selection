@@ -119,14 +119,13 @@ python -m token_selection.scripts.freeze_order \
 python -m token_selection.scripts.validate_experiment \
   --config token_selection/configs/run_10b.yaml --olmo-root /opt/OLMo-core
 
-# 5) Launch on a single B200. --olmo-root is REQUIRED for --launch.
-torchrun --nproc_per_node=1 -m token_selection.scripts.train_olmo_template \
-  --config token_selection/configs/run_10b.yaml --method rel_ema \
-  --olmo-root /opt/OLMo-core --launch
+# 5) Launch on physical GPU 7 only (shared 8×B200 node). The wrapper sets
+# CUDA_VISIBLE_DEVICES=7 before Python starts; --launch also refuses if GPU 7 is busy.
+./token_selection/scripts/launch_gpu7.sh token_selection/configs/run_10b.yaml rel_ema
+# Short memory smoke (same microbatch, 64 steps):
+./token_selection/scripts/launch_gpu7.sh token_selection/configs/run_10b_smoke.yaml rel_ema
 # Restart after a crash / wall-clock timeout (guarded resume):
-torchrun --nproc_per_node=1 -m token_selection.scripts.train_olmo_template \
-  --config token_selection/configs/run_10b.yaml --method rel_ema \
-  --olmo-root /opt/OLMo-core --launch --resume
+./token_selection/scripts/launch_gpu7.sh token_selection/configs/run_10b.yaml rel_ema --resume
 
 # 6) Publish this run's outputs
 python -m token_selection.scripts.sync_artifacts \

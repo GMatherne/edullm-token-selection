@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal
@@ -37,6 +39,79 @@ from token_selection.scripts.experiment_contract import (
 )
 
 MethodName = Literal["full", "rel_ema"]
+
+# On a shared multi-GPU host, launching without an explicit pin would default to
+# physical GPU 0. Refuse that rather than compete with whatever owns the other devices.
+_IDLE_MEMORY_MIB = 256
+
+
+def pin_cuda_visible_devices(cfg: Dict[str, Any]) -> str:
+    """Force ``CUDA_VISIBLE_DEVICES`` to the configured physical GPU and verify it is idle.
+
+    Must run before any CUDA context is created. Sets the env var, checks the *physical*
+    device via ``nvidia-smi -i``, and refuses to proceed if that device is already holding
+    more than a trivial amount of memory. Returns the pinned index string.
+    """
+    raw = (cfg.get("train") or {}).get("cuda_visible_devices")
+    if raw is None or str(raw).strip() == "":
+        raise SystemExit(
+            "train.cuda_visible_devices is required for --launch. On a multi-GPU host "
+            "omitting it would let torch grab GPU 0. Set it to the idle physical index "
+            '(e.g. "7") or use scripts/launch_gpu7.sh.'
+        )
+    pinned = str(raw).strip()
+    if "," in pinned or not pinned.isdigit():
+        raise SystemExit(
+            f"train.cuda_visible_devices must be a single integer GPU index, got {pinned!r}"
+        )
+
+    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if existing is not None and existing.strip() != pinned:
+        raise SystemExit(
+            f"CUDA_VISIBLE_DEVICES is already {existing!r} but train.cuda_visible_devices "
+            f"is {pinned!r}. Refusing to launch against a conflicting pin."
+        )
+    os.environ["CUDA_VISIBLE_DEVICES"] = pinned
+
+    try:
+        probe = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "-i",
+                pinned,
+                "--query-gpu=index,uuid,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(
+            f"Unable to query physical GPU {pinned} via nvidia-smi; refusing to launch. ({exc})"
+        ) from exc
+
+    parts = [p.strip() for p in probe.split(",")]
+    if len(parts) < 3 or parts[0] != pinned:
+        raise SystemExit(f"Unexpected nvidia-smi response for GPU {pinned}: {probe!r}")
+    used_mib = int(float(parts[2]))
+    if used_mib > _IDLE_MEMORY_MIB:
+        raise SystemExit(
+            f"Physical GPU {pinned} is not idle ({used_mib} MiB used > {_IDLE_MEMORY_MIB} MiB). "
+            "Refusing to launch so we do not share a device with another job."
+        )
+    print(
+        json.dumps(
+            {
+                "cuda_visible_devices": pinned,
+                "physical_gpu": pinned,
+                "uuid": parts[1],
+                "memory_used_mib": used_mib,
+                "status": "pinned_idle",
+            }
+        ),
+        flush=True,
+    )
+    return pinned
 
 
 def _token_paths(tokens_dir: Path, *, expected_tokenizer: str) -> List[str]:
@@ -128,14 +203,15 @@ def build_plan(
         "s3_tokens": resolve_tokens_s3(cfg),
         "s3_checkpoints": s3_uri(cfg, method, bucket_key="checkpoint_bucket"),
         "torchrun_example": (
-            "torchrun --nproc_per_node=1 -m token_selection.scripts.train_olmo_template "
-            f"--config token_selection/configs/run_10b.yaml --method {method} "
-            "--olmo-root /path/to/edu-llm/OLMo-core --launch"
+            "CUDA_VISIBLE_DEVICES=7 ./token_selection/scripts/launch_gpu7.sh "
+            f"token_selection/configs/run_10b.yaml {method}"
         ),
+        "cuda_visible_devices": str((cfg.get("train") or {}).get("cuda_visible_devices") or ""),
         "notes": [
             "TokenSelectTrainModule with NumpyDataLoaderConfig seed + order contract.",
             "Tokens come from data.tokens_s3; order is produced locally by freeze_order.",
             "Scratch initialization never resumes an existing save folder or loads optimizer/trainer state.",
+            "Launch pins train.cuda_visible_devices (physical GPU 7) and refuses a busy device.",
         ],
     }
 
@@ -487,12 +563,21 @@ def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName,
 
 def try_launch(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName, *, resume: bool = False) -> None:
     """Initialize OLMo-core, build, and fit. Resume is gated by a run-fingerprint match."""
+    # Pin before any CUDA context: must precede prepare_training_environment / build_trainer.
+    pin_cuda_visible_devices(cfg)
     _prepare_run_dir(plan, resume=resume)
     try:
         from olmo_core.train import prepare_training_environment, teardown_training_environment  # type: ignore
         from olmo_core.utils import seed_all  # type: ignore
+        import torch
     except ImportError as e:
         raise SystemExit(f"olmo_core not installed: {e}") from e
+
+    if torch.cuda.is_available() and torch.cuda.device_count() != 1:
+        raise SystemExit(
+            f"Expected exactly one visible CUDA device after pinning, found "
+            f"{torch.cuda.device_count()}. Check CUDA_VISIBLE_DEVICES."
+        )
 
     prepare_training_environment(seed=int(plan["init_seed"]))
     seed_all(int(plan["init_seed"]))

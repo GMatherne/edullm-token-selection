@@ -88,6 +88,10 @@ train:
   # and per-sequence top-k selection plus the batch-level loss divisor make the gradient
   # independent of how the batch is split.
   rank_microbatch_size: 65536
+  # Physical GPU index on the shared B200 node. Launch refuses to start unless this
+  # exact device is the only one visible (via CUDA_VISIBLE_DEVICES) and is idle.
+  # Do not omit this on a multi-GPU host: without it torch would default to GPU 0.
+  cuda_visible_devices: "7"
   num_workers: 8
   # Checkpointing. total_steps ~= 2384 (10B / 4.194M tokens per step); REL warmup
   # T0 ~= 48 steps. Permanent checkpoints are kept for later eval.

@@ -50,6 +50,8 @@ train:
   data_loader_chunk_size: 1
   # Same microbatch as the real run — that is the point of this smoke.
   rank_microbatch_size: 65536
+  # Same physical GPU pin as the real run. Required on the shared 8×B200 node.
+  cuda_visible_devices: "7"
   num_workers: 8
   checkpoint_every_steps: 64
   checkpoint_keep_last: null
