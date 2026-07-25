@@ -151,11 +151,12 @@ single GPU, and it is sized by the **logits tensor, not the parameters**: REL sc
 needs full unsharded logits, so this train module cannot use a fused linear+CE and
 instead materializes `[seqs, 2048, ~100k vocab]`, about 0.41 GB per sequence in bf16.
 
-At the default 262144 tokens (128 sequences) that is ~53 GB per copy and roughly 105 GB
-live against 180 GB of HBM. Two things keep it there: the scoring logits are released
-before the train forward allocates its own, and the per-token cross-entropy is computed
-**once** and reused for both the REL score and the objective instead of running a second
-log-softmax the size of the logits. Without those, the same setting would need ~210 GB.
+At the default 65536 tokens (32 sequences) that is ~13 GB per copy and roughly 26 GB of
+logits live, with activations of the same order — real margin against 180 GB of HBM.
+Two things keep logits from doubling: the scoring logits are released before the train
+forward allocates its own, and the per-token cross-entropy is computed **once** and reused
+for both the REL score and the objective. The previous 128-sequence setting was expected
+to OOM once activations were counted alongside logits.
 
 **This is the one unmeasured knob.** If it OOMs it will do so at step 48, the first
 REL-active step, where the history forward appears — so you find out in minutes, not
@@ -163,7 +164,8 @@ hours. Halve `rank_microbatch_size` and relaunch with `--resume`; the knob is
 deliberately excluded from the run fingerprint so the identity guard allows it, and the
 gradient is unchanged by the split because top-k selection is per sequence and the loss
 divisor is the batch-level selected-token count. Allocation sizes are constant per step,
-so if step 48 survives, a later OOM is unlikely.
+so if step 48 survives, a later OOM is unlikely. Raise the microbatch only after a smoke
+reports `torch.cuda.max_memory_allocated()`.
 
 REL still costs a second forward per micro-batch, and masking loss does not shrink the
 backward pass, so a REL step is ~1.33x a full-token step: ~29.4 EFLOPs for the run

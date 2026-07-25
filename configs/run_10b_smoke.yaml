@@ -1,0 +1,63 @@
+# Short memory/plumbing smoke for the 10B REL run. Same model, tokenizer, corpus,
+# microbatch, and REL schedule knobs as run_10b.yaml — only the token budget is
+# shortened so we hit the first REL-active step (history forward) and stop.
+#
+# At max_tokens = 268435456 and GBS = 4194304: total_steps = 64, t0_steps = 1.
+# Steps 2..64 exercise the EMA history forward under the same per-microbatch
+# memory pressure the full run will see. Checkpoints land under a distinct
+# prefix so they cannot collide with the real run's fingerprint.
+
+run_id: rel-ema-10b-scratch-smoke-v1
+seed: 42
+output_dir: token_selection/data/10b_smoke
+
+methods: [rel_ema]
+
+k: 0.6
+t0_frac: 0.02
+alpha_start: 0.99
+alpha_end: 0.98
+
+data:
+  tokens_s3: s3://edullm-dataset-regmix/regmix-10b/tokenized
+  tokenizer: allenai/dolma2-tokenizer
+  sequence_length: 2048
+
+s3:
+  dataset_bucket: edullm-dataset-olmo
+  checkpoint_bucket: edullm-checkpoints
+  prefix: token-selection/rel-ema-10b-scratch-smoke-v1
+  profile: sbsandbox
+
+model:
+  name: OLMo-2-370M-scratch
+  arch: olmo2_370M
+  init_mode: scratch
+  init_seed: 42
+  load_path: null
+
+olmo_core:
+  repository: https://github.com/edu-llm/OLMo-core
+  revision: 99e0009ed67679c90da970ec5ba439c9459e3757
+
+train:
+  max_tokens: 268435456
+  global_batch_size: 4194304
+  lr: 4.0e-4
+  warmup_steps: 24
+  data_loader_seed: 42
+  data_loader_initial_epoch: 0
+  data_loader_chunk_size: 1
+  # Same microbatch as the real run — that is the point of this smoke.
+  rank_microbatch_size: 65536
+  num_workers: 8
+  checkpoint_every_steps: 64
+  checkpoint_keep_last: null
+  checkpoint_milestone_steps: [1]
+  pre_train_checkpoint: false
+  save_async: true
+  ephemeral_checkpoint_every_steps: 32
+
+eval:
+  block_unit: sequence
+  metrics_filename: metrics.json

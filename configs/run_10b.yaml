@@ -72,21 +72,22 @@ train:
   data_loader_initial_epoch: 0
   data_loader_chunk_size: 1
   # Single-B200 hardware knob, in tokens; on one GPU the full global_batch is local.
-  # 256K tokens = 128 sequences -> 16 microbatches per step (GBS = 2048 sequences).
+  # 64K tokens = 32 sequences -> 64 microbatches per step (GBS = 2048 sequences).
   #
-  # Sized by LOGITS, not parameters. REL scoring needs full unsharded logits, so
-  # TokenSelectTrainModule cannot use a fused linear+CE: it materializes a
-  # [seqs, 2048, ~100k vocab] tensor, ~0.41 GB per sequence in bf16. At 128 sequences
-  # that is ~53 GB per copy, and the step keeps about two copies live (the train logits
-  # plus the log-softmax the backward pass needs), so ~105 GB of logits against 180 GB
-  # of HBM. That only fits because the scoring logits are freed before the train forward
-  # and the per-token CE is computed once instead of twice; before those two changes the
-  # same setting needed ~210 GB. THIS IS THE UNMEASURED KNOB: if step 48 (the first
+  # Sized by LOGITS + ACTIVATIONS, not parameters. REL scoring needs full unsharded
+  # logits, so TokenSelectTrainModule cannot use a fused linear+CE: it materializes a
+  # [seqs, 2048, ~100k vocab] tensor, ~0.41 GB per sequence in bf16. At 32 sequences that
+  # is ~13 GB per copy; with the train logits and the log-softmax the backward pass needs,
+  # about ~26 GB of logits. Activations for olmo2_370M (d=1024, 16 layers) without
+  # activation checkpointing are the same order of magnitude, so the previous 128-sequence
+  # setting (~105 GB logits alone, plus activations) was expected to OOM on 183 GB HBM.
+  # 32 sequences leaves real margin; raise it only after a measured smoke reports
+  # torch.cuda.max_memory_allocated(). THIS IS THE UNMEASURED KNOB: if step 48 (the first
   # REL-active step, where the history forward appears) OOMs, halve this and relaunch
   # with --resume. It is deliberately absent from the run fingerprint so that is allowed,
   # and per-sequence top-k selection plus the batch-level loss divisor make the gradient
   # independent of how the batch is split.
-  rank_microbatch_size: 262144
+  rank_microbatch_size: 65536
   num_workers: 8
   # Checkpointing. total_steps ~= 2384 (10B / 4.194M tokens per step); REL warmup
   # T0 ~= 48 steps. Permanent checkpoints are kept for later eval.
