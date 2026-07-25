@@ -370,7 +370,17 @@ def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName,
 
     try:
         # --- data --------------------------------------------------------------------
-        tokenizer = TokenizerConfig.from_hf(plan["tokenizer"])
+        # allenai/dolma2-tokenizer is a tokenizer-only HF repo (no model config.json with
+        # vocab_size). OLMo-core's from_hf looks for that first and fails closed; use the
+        # built-in dolma2() config instead, which matches the corpus sidecars
+        # (eos_token_id=100257, vocab_size=100278, pad_token_id=100277).
+        tokenizer_id = str(plan["tokenizer"])
+        if tokenizer_id in {"allenai/dolma2-tokenizer", "dolma2"} or tokenizer_id.endswith(
+            "/dolma2-tokenizer"
+        ):
+            tokenizer = TokenizerConfig.dolma2()
+        else:
+            tokenizer = TokenizerConfig.from_hf(tokenizer_id)
         dataset_cfg = NumpyFSLDatasetConfig(
             paths=list(plan["token_paths"]),
             sequence_length=seq_len,
