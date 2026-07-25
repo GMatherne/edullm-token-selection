@@ -1,0 +1,111 @@
+# REL+EMA from-scratch pretraining on a single B200.
+# Pre-tokenized corpus is read from data.tokens_s3; this run writes metrics/checkpoints.
+
+run_id: rel-ema-10b-scratch-v1
+seed: 42
+output_dir: token_selection/data/10b
+
+methods: [rel_ema]
+
+k: 0.6
+t0_frac: 0.02
+# EMA lag decays from roughly 100 to 50 optimizer steps.
+#
+# The EMA is bias-corrected (see olmo_ext/ema.py), so the random initialization is
+# excluded from the history by construction and alpha is purely a question of how far
+# back the reference should look. These are shorter than ssToken's fine-tuning defaults
+# because the whole run is only ~2384 steps: alpha=0.999 would eventually average over
+# ~1000 steps, roughly half the run, which is a very stale yardstick. At 0.99 the
+# history trails by ~100 steps (~4% of the run) and tightens to ~50 as training
+# converges. Watch mean_rel_kept vs mean_rel_dropped in the metrics ledger: kept should
+# sit above dropped once selection starts.
+alpha_start: 0.99
+alpha_end: 0.98
+
+data:
+  # The RegMix 10B corpus, already tokenized: one raw headerless uint32 shard per domain
+  # at <domain>/<domain>.npy with a JSON sidecar beside it, plus paths.txt listing all 7.
+  # 40,019,228,164 bytes = 10,004,807,041 tokens across
+  # algebraic-stack, arxiv, dclm, open-web-math, pes2o, starcoder, wiki.
+  # There is no manifest.json in the bucket; build_token_manifest.py derives it locally.
+  tokens_s3: s3://edullm-dataset-regmix/regmix-10b/tokenized
+  # Ground truth from the corpus sidecars, not a preference: every shard records
+  # tokenizer=allenai/dolma2-tokenizer, eos_token_id=100257. The tokenizer fixes
+  # padded_vocab_size() and therefore the embedding table, so preflight fails closed if
+  # this disagrees with the corpus.
+  tokenizer: allenai/dolma2-tokenizer
+  sequence_length: 2048
+
+s3:
+  # Per-run outputs only (metrics live here; checkpoints use checkpoint_bucket).
+  dataset_bucket: edullm-dataset-olmo
+  checkpoint_bucket: edullm-checkpoints
+  prefix: token-selection/rel-ema-10b-scratch-v1
+  profile: sbsandbox
+
+model:
+  name: OLMo-2-370M-scratch
+  # OLMo-core TransformerConfig builder (verified present at the pinned revision).
+  arch: olmo2_370M
+  init_mode: scratch
+  init_seed: 42
+  # A checkpoint path is forbidden for this experiment. It would make this CPT.
+  load_path: null
+
+olmo_core:
+  repository: https://github.com/edu-llm/OLMo-core
+  revision: 99e0009ed67679c90da970ec5ba439c9459e3757
+
+train:
+  # One pass, no repeats. NumpyFSLDataset truncates each shard to a whole number of
+  # sequences, so the 7-shard corpus serves 4,885,156 sequences = 10,004,799,488 tokens
+  # per epoch; this budget is 99.95% of that and validate_experiment.py refuses a value
+  # that would wrap the loader into a replaying second epoch.
+  max_tokens: 10000000000
+  # Scientific contract: do not change for hardware. 4.194M tokens = 2048 seqs/step.
+  global_batch_size: 4194304
+  lr: 4.0e-4
+  # LR warmup, in optimizer steps. Pinned in the run fingerprint, so it is set
+  # explicitly rather than left to the 1%-of-total_steps default.
+  warmup_steps: 24
+  data_loader_seed: 42
+  data_loader_initial_epoch: 0
+  data_loader_chunk_size: 1
+  # Single-B200 hardware knob, in tokens; on one GPU the full global_batch is local.
+  # 256K tokens = 128 sequences -> 16 microbatches per step (GBS = 2048 sequences).
+  #
+  # Sized by LOGITS, not parameters. REL scoring needs full unsharded logits, so
+  # TokenSelectTrainModule cannot use a fused linear+CE: it materializes a
+  # [seqs, 2048, ~100k vocab] tensor, ~0.41 GB per sequence in bf16. At 128 sequences
+  # that is ~53 GB per copy, and the step keeps about two copies live (the train logits
+  # plus the log-softmax the backward pass needs), so ~105 GB of logits against 180 GB
+  # of HBM. That only fits because the scoring logits are freed before the train forward
+  # and the per-token CE is computed once instead of twice; before those two changes the
+  # same setting needed ~210 GB. THIS IS THE UNMEASURED KNOB: if step 48 (the first
+  # REL-active step, where the history forward appears) OOMs, halve this and relaunch
+  # with --resume. It is deliberately absent from the run fingerprint so that is allowed,
+  # and per-sequence top-k selection plus the batch-level loss divisor make the gradient
+  # independent of how the batch is split.
+  rank_microbatch_size: 262144
+  num_workers: 8
+  # Checkpointing. total_steps ~= 2384 (10B / 4.194M tokens per step); REL warmup
+  # T0 ~= 48 steps. Permanent checkpoints are kept for later eval.
+  checkpoint_every_steps: 500           # permanent: steps 500,1000,...,2000 + final
+  # KEEP ALL permanent checkpoints. OLMo-core's CheckpointerCallback defaults
+  # max_checkpoints=3 and prunes the oldest permanents past that; null disables pruning
+  # so every analysis snapshot survives. Set an int only if disk is constrained.
+  checkpoint_keep_last: null
+  # Extra permanent milestones (OLMo-core `fixed_steps`) around the REL warmup boundary,
+  # so the EMA-off -> EMA-on transition is captured for analysis. These count toward
+  # checkpoint_keep_last (null = unlimited here).
+  checkpoint_milestone_steps: [48, 250, 750]
+  pre_train_checkpoint: true            # also snapshot the scratch init (step 0)
+  save_async: true                      # non-blocking distributed saves
+  # Ephemeral (auto-pruned) checkpoints for crash/wall-clock resume, used by
+  # `train_olmo_template.py --resume`. Must be < checkpoint_every_steps. Tuned for
+  # B200 step times (~few s/step for 370M); ~250 steps ≈ 10–20 min lost work.
+  ephemeral_checkpoint_every_steps: 250
+
+eval:
+  block_unit: sequence
+  metrics_filename: metrics.json

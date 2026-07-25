@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""OLMo-core scratch entry for ``rel_ema`` (and optional ``full``) on local tokens/order.
+
+Requires edu-llm/OLMo-core installed. Builds trainer configs from the experiment
+YAML and documents the torchrun launch. ``--launch`` fails closed if the requested
+frozen-order controls cannot be represented by the pinned public APIs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Literal
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from token_selection.olmo_ext.train_module import make_ts_config
+from token_selection.scripts import (
+    derive_steps,
+    load_config,
+    resolve_output_dir,
+    resolve_tokens_s3,
+    s3_uri,
+)
+from token_selection.scripts.experiment_contract import (
+    manifest_train_paths,
+    validate_order_contract,
+    validate_scratch_config,
+    validate_token_budget,
+    validate_token_manifest,
+    verify_olmo_revision,
+)
+
+MethodName = Literal["full", "rel_ema"]
+
+
+def _token_paths(tokens_dir: Path, *, expected_tokenizer: str) -> List[str]:
+    """Training shards come from the manifest, not a glob (see manifest_train_paths)."""
+    try:
+        return manifest_train_paths(tokens_dir, expected_tokenizer=expected_tokenizer)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def build_plan(
+    cfg: Dict[str, Any],
+    *,
+    method: MethodName,
+    out: Path,
+) -> Dict[str, Any]:
+    total_steps, t0_steps = derive_steps(cfg)
+    ts_cfg = make_ts_config(cfg, method=method, total_steps=total_steps, t0_steps=t0_steps)
+    tokens_dir = out / "tokens"
+    order_dir = out / "order"
+    tokenizer = str((cfg.get("data") or {}).get("tokenizer") or "")
+    if not tokenizer:
+        raise SystemExit("data.tokenizer is required; it fixes the model's vocabulary size")
+    paths = _token_paths(tokens_dir, expected_tokenizer=tokenizer)
+    try:
+        token_budget = validate_token_budget(
+            cfg, validate_token_manifest(tokens_dir, expected_tokenizer=tokenizer)
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    order_manifest_path = order_dir / "manifest.json"
+    if not order_manifest_path.exists():
+        raise SystemExit(f"Missing order contract {order_manifest_path}; run freeze_order first")
+    order_manifest = json.loads(order_manifest_path.read_text(encoding="utf-8"))
+    try:
+        validate_order_contract(
+            cfg, output_dir=out, contract=order_manifest["order_contract"]
+        )
+    except (KeyError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    arch = (cfg.get("model") or {}).get("arch")
+    if not arch:
+        raise SystemExit(
+            "model.arch is required (e.g. olmo2_370M). Refusing to guess an architecture; "
+            "a silent default could mismatch the externally trained baseline arm."
+        )
+    olmo_revision = str((cfg.get("olmo_core") or {}).get("revision") or "")
+    warmup_steps = max(
+        1, int((cfg.get("train") or {}).get("warmup_steps", round(0.01 * total_steps)))
+    )
+
+    return {
+        "run_id": cfg["run_id"],
+        "method": method,
+        "seed": int(cfg["seed"]),
+        "init_mode": "scratch",
+        "init_seed": int((cfg.get("model") or {}).get("init_seed", cfg["seed"])),
+        "load_path": None,
+        "model_name": cfg["model"]["name"],
+        "model_arch": str(arch),
+        "olmo_revision": olmo_revision,
+        "tokenizer": cfg["data"]["tokenizer"],
+        "sequence_length": int(cfg["data"]["sequence_length"]),
+        "max_tokens": int(cfg["train"]["max_tokens"]),
+        "global_batch_size": int(cfg["train"]["global_batch_size"]),
+        "data_loader_seed": int((cfg.get("train") or {}).get("data_loader_seed", cfg["seed"])),
+        "lr": float(cfg["train"]["lr"]),
+        "warmup_steps": warmup_steps,
+        "total_steps": total_steps,
+        "t0_steps": t0_steps if method == "rel_ema" else 0,
+        "ts_cfg": ts_cfg.__dict__,
+        "token_paths": paths,
+        "token_budget": token_budget,
+        "data_order": {
+            "contract": order_manifest["order_contract"],
+            "supported": True,
+            "reason": (
+                "NumpyDataLoaderConfig seed plus immutable token-manifest fingerprint "
+                "is the public OLMo-core global-index order contract."
+            ),
+        },
+        "save_folder": str(out / "checkpoints" / method),
+        # Deliberately outside save_folder: the fresh-scratch guard rejects a non-empty
+        # save folder, so anything the build writes there before the run is pinned would
+        # block the relaunch after a failed build.
+        "dataset_cache": str(out / "dataset_cache" / method),
+        "metrics_dir": str(out / "metrics" / method),
+        "s3_tokens": resolve_tokens_s3(cfg),
+        "s3_checkpoints": s3_uri(cfg, method, bucket_key="checkpoint_bucket"),
+        "torchrun_example": (
+            "torchrun --nproc_per_node=1 -m token_selection.scripts.train_olmo_template "
+            f"--config token_selection/configs/run_10b.yaml --method {method} "
+            "--olmo-root /path/to/edu-llm/OLMo-core --launch"
+        ),
+        "notes": [
+            "TokenSelectTrainModule with NumpyDataLoaderConfig seed + order contract.",
+            "Tokens come from data.tokens_s3; order is produced locally by freeze_order.",
+            "Scratch initialization never resumes an existing save folder or loads optimizer/trainer state.",
+        ],
+    }
+
+
+def _assert_launch_capabilities(plan: Dict[str, Any]) -> None:
+    """Refuse a scientifically invalid launch rather than silently weakening the plan."""
+    blockers = []
+    if not plan["data_order"]["supported"]:
+        blockers.append(plan["data_order"]["reason"])
+    if blockers:
+        detail = "\n - ".join(blockers)
+        raise SystemExit(
+            "Refusing to launch: required Fair REL controls are not implemented by the "
+            "pinned OLMo-core public APIs.\n - " + detail
+        )
+
+
+def _assert_fresh_save_folder(save_folder: Path) -> None:
+    """A scratch arm must not accidentally continue or overwrite a prior arm."""
+    if save_folder.exists() and any(save_folder.iterdir()):
+        contents = sorted(p.name for p in save_folder.iterdir())[:5]
+        raise SystemExit(
+            f"Scratch run refuses non-empty save folder: {save_folder} (contains {contents}). "
+            "Pass --resume to continue a matching run, choose a new run directory, or "
+            "delete the folder if a previous launch failed before training started."
+        )
+
+
+def _run_fingerprint(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Identity that must be unchanged for a resume to be scientifically valid.
+
+    It pins initialization (arch + seed + name + tokenizer + OLMo revision), the frozen
+    data order, batching, the token budget, the learning rate, and the REL selection
+    schedule (k / EMA alphas / warmup). A resume that changed any of
+    these would silently continue a *different* experiment, so we refuse it. The checkpoint
+    only carries EMA/optimizer state, not these knobs, which is exactly why they must be
+    re-pinned here rather than trusted to the restored state.
+    """
+    ts_cfg = plan.get("ts_cfg") or {}
+    return {
+        "run_id": str(plan["run_id"]),
+        "method": str(plan["method"]),
+        "seed": int(plan["seed"]),
+        "init_seed": int(plan["init_seed"]),
+        "model_name": str(plan["model_name"]),
+        "model_arch": str(plan["model_arch"]),
+        "olmo_revision": str(plan.get("olmo_revision", "")),
+        "tokenizer": str(plan["tokenizer"]),
+        "sequence_length": int(plan["sequence_length"]),
+        "max_tokens": int(plan["max_tokens"]),
+        "global_batch_size": int(plan["global_batch_size"]),
+        "lr": float(plan["lr"]),
+        "warmup_steps": int(plan["warmup_steps"]),
+        "t0_steps": int(plan["t0_steps"]),
+        "rel_k": float(ts_cfg.get("k", 0.0)),
+        "rel_alpha_start": float(ts_cfg.get("alpha_start", 0.0)),
+        "rel_alpha_end": float(ts_cfg.get("alpha_end", 0.0)),
+        "order_contract_sha256": str(plan["data_order"]["contract"]["contract_sha256"]),
+    }
+
+
+def _fingerprint_path(plan: Dict[str, Any]) -> Path:
+    return Path(plan["save_folder"]) / "run_fingerprint.json"
+
+
+def _prepare_run_dir(plan: Dict[str, Any], *, resume: bool) -> None:
+    """Enforce fresh-scratch on first launch, or a fingerprint match on resume.
+
+    On a fresh launch the identity is *checked* here but only *committed*
+    (``_commit_run_fingerprint``) after the trainer builds successfully, so a build
+    that dies (e.g. an OLMo-core API/env error) cannot strand a lone fingerprint that
+    would then block a clean relaunch.
+    """
+    save_folder = Path(plan["save_folder"])
+    fingerprint_path = _fingerprint_path(plan)
+    current = _run_fingerprint(plan)
+    if resume:
+        if not fingerprint_path.exists():
+            raise SystemExit(
+                f"--resume set but no run_fingerprint.json under {save_folder}; there is "
+                "nothing to resume. Launch without --resume to start the run."
+            )
+        prior = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+        if prior != current:
+            diffs = sorted(k for k in current if prior.get(k) != current.get(k))
+            raise SystemExit(
+                "Refusing to resume: the run identity changed since the checkpoint was "
+                f"written (differing fields: {diffs}). Resuming would break the matched "
+                "REL-vs-full comparison."
+            )
+        return
+    # Fresh scratch launch: the folder must be empty (the fingerprint is written later).
+    _assert_fresh_save_folder(save_folder)
+    save_folder.mkdir(parents=True, exist_ok=True)
+
+
+def _commit_run_fingerprint(plan: Dict[str, Any], *, resume: bool) -> None:
+    """Persist the fresh-launch identity once the trainer is known to build."""
+    if resume:
+        return
+    _fingerprint_path(plan).write_text(
+        json.dumps(_run_fingerprint(plan), indent=2), encoding="utf-8"
+    )
+
+
+def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName, *, resume: bool = False):
+    """Assemble the OLMo-core Trainer for one arm. Returns the built ``trainer``.
+
+    Both methods take the same direct TokenSelectTrainModule construction path. The
+    function first rejects unavailable frozen-order wiring. When ``resume``
+    is set, the trainer is allowed to reload the latest checkpoint (model + optimizer +
+    trainer/callback state, including REL's EMA) from the save folder; otherwise it is
+    forbidden from resuming so a scratch arm cannot silently continue.
+    """
+    _assert_launch_capabilities(plan)
+    try:
+        import torch.distributed.checkpoint.state_dict as dist_cp_sd  # type: ignore
+        from olmo_core.config import DType  # type: ignore
+        from olmo_core.data import (  # type: ignore
+            NumpyDataLoaderConfig,
+            NumpyFSLDatasetConfig,
+            TokenizerConfig,
+        )
+        from olmo_core.distributed.parallel import DataParallelType  # type: ignore
+        from olmo_core.nn.transformer import TransformerConfig  # type: ignore
+        from olmo_core.optim import AdamWConfig, CosWithWarmup  # type: ignore
+        from olmo_core.train import Duration, LoadStrategy, TrainerConfig  # type: ignore
+        from olmo_core.train.callbacks import CheckpointerCallback  # type: ignore
+        from olmo_core.train.train_module.transformer import (  # type: ignore
+            TransformerDataParallelConfig,
+            TransformerTrainModuleConfig,
+        )
+    except ImportError as e:
+        raise SystemExit(
+            "olmo_core not installed. pip install -e /path/to/edu-llm/OLMo-core\n"
+            f"Original error: {e}"
+        ) from e
+
+    from token_selection.olmo_ext.train_module import (
+            RELCallback,
+            TokenSelectConfig,
+            TokenSelectTrainModule,
+        )
+    from token_selection.olmo_ext.callbacks import (
+        RawComputeCallback,
+        build_metrics_payload,
+    )
+
+    ts_cfg = TokenSelectConfig(
+        **{k: v for k, v in plan["ts_cfg"].items() if k in TokenSelectConfig.__dataclass_fields__}
+    )
+    seq_len = int(plan["sequence_length"])
+    gbs = int(plan["global_batch_size"])
+    seed = int(plan["seed"])
+    total_steps = int(plan["total_steps"])
+
+    try:
+        # --- data --------------------------------------------------------------------
+        tokenizer = TokenizerConfig.from_hf(plan["tokenizer"])
+        dataset_cfg = NumpyFSLDatasetConfig(
+            paths=list(plan["token_paths"]),
+            sequence_length=seq_len,
+            tokenizer=tokenizer,
+            work_dir=str(plan["dataset_cache"]),
+        )
+        loader_cfg = NumpyDataLoaderConfig(
+            global_batch_size=gbs,
+            seed=int(plan["data_loader_seed"]),  # identical across arms -> identical order
+            num_workers=int(cfg.get("train", {}).get("num_workers", 4)),
+        )
+
+        # --- model + optim -----------------------------------------------------------
+        arch = str(plan["model_arch"])
+        model_builder = getattr(TransformerConfig, arch, None)
+        if model_builder is None or not callable(model_builder):
+            raise SystemExit(
+                f"OLMo-core TransformerConfig has no builder {arch!r}; set model.arch "
+                "to a valid olmo2_* size (e.g. olmo2_370M)."
+            )
+        model_cfg = model_builder(
+            vocab_size=tokenizer.padded_vocab_size(),
+            init_seed=int(plan["init_seed"]),
+        )
+        # Exact, world-size-independent param count so the FLOPs axis and the
+        # cross-arm n_params equality check cannot drift between machines/GPU counts.
+        n_params = int(model_cfg.num_params)
+        optim_cfg = AdamWConfig(lr=float(plan["lr"]))
+        warmup_steps = int(plan["warmup_steps"])
+        scheduler = CosWithWarmup(warmup_steps=warmup_steps)
+
+        rank_mbz = int(cfg.get("train", {}).get("rank_microbatch_size", seq_len))
+        train_module_cfg = TransformerTrainModuleConfig(
+            rank_microbatch_size=rank_mbz,
+            max_sequence_length=seq_len,
+            optim=optim_cfg,
+            scheduler=scheduler,
+            dp_config=TransformerDataParallelConfig(
+                name=DataParallelType.fsdp,
+                param_dtype=DType.bfloat16,
+                reduce_dtype=DType.float32,
+            ),
+        )
+        if train_module_cfg.pp_config is not None:
+            raise SystemExit(
+                "TokenSelectTrainModule currently supports the non-pipeline "
+                "TransformerTrainModule path only."
+            )
+
+        # --- trainer -----------------------------------------------------------------
+        train_cfg = cfg.get("train", {})
+        # Permanent checkpoints (kept for post-hoc eval/analysis) plus optional
+        # auto-pruned ephemeral checkpoints for crash/wall-clock resume (used by --resume).
+        # NOTE: OLMo-core's CheckpointerCallback defaults max_checkpoints=3 and *prunes the
+        # oldest permanent checkpoints past that*, so we must set it explicitly (None keeps
+        # every permanent checkpoint) or the analysis snapshots would silently disappear.
+        ckpt_kwargs: Dict[str, Any] = {
+            "save_interval": int(train_cfg.get("checkpoint_every_steps", 1000)),
+            "max_checkpoints": train_cfg.get("checkpoint_keep_last", None),
+        }
+        ephemeral_interval = train_cfg.get("ephemeral_checkpoint_every_steps")
+        if ephemeral_interval is not None:
+            ckpt_kwargs["ephemeral_save_interval"] = int(ephemeral_interval)
+        milestone_steps = train_cfg.get("checkpoint_milestone_steps")
+        if milestone_steps:
+            ckpt_kwargs["fixed_steps"] = [int(step) for step in milestone_steps]
+        if train_cfg.get("pre_train_checkpoint") is not None:
+            ckpt_kwargs["pre_train_checkpoint"] = bool(train_cfg.get("pre_train_checkpoint"))
+        if train_cfg.get("save_async") is not None:
+            ckpt_kwargs["save_async"] = bool(train_cfg.get("save_async"))
+        trainer_cfg = (
+            TrainerConfig(
+                save_folder=str(plan["save_folder"]),
+                # Resume is gated by a run-fingerprint match in try_launch(). With resume
+                # off we forbid save-folder-first resumption so a scratch arm cannot
+                # silently continue a prior run. With resume on, fit() auto-loads the
+                # latest save-folder checkpoint (trainer + optim + callback/EMA state).
+                load_strategy=LoadStrategy.if_available if resume else LoadStrategy.never,
+                load_trainer_state=bool(resume),
+                load_optim_state=bool(resume),
+                max_duration=Duration.tokens(int(plan["max_tokens"])),
+            )
+            .with_callback("checkpointer", CheckpointerCallback(**ckpt_kwargs))
+        )
+        # init_id binds everything that determines the initial weights + token space:
+        # arch (not just param count), init seed, sequence length, tokenizer, and the
+        # pinned OLMo-core revision. A baseline arm that differs in any of these produces
+        # a different init_id and compare_runs fails closed instead of comparing apples to
+        # oranges (n_params equality alone cannot catch same-size arch/tokenizer drift).
+        init_id = hashlib.sha256(
+            json.dumps(
+                {
+                    "model_name": plan["model_name"],
+                    "model_arch": plan["model_arch"],
+                    "init_seed": plan["init_seed"],
+                    "sequence_length": seq_len,
+                    "tokenizer": plan["tokenizer"],
+                    "olmo_revision": plan.get("olmo_revision", ""),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        # spec_id binds the shared training spec (budget, batch, LR, warmup, tokenizer,
+        # arch) so the externally trained `full` arm cannot silently use a different
+        # recipe. warmup_steps is included because the LR-warmup schedule directly shapes
+        # the loss curve and must match across arms.
+        spec_id = hashlib.sha256(
+            json.dumps(
+                {
+                    "max_tokens": int(plan["max_tokens"]),
+                    "global_batch_size": gbs,
+                    "sequence_length": seq_len,
+                    "lr": float(plan["lr"]),
+                    "warmup_steps": int(warmup_steps),
+                    "model_arch": plan["model_arch"],
+                    "tokenizer": plan["tokenizer"],
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        metrics_payload = build_metrics_payload(
+            run_id=str(plan["run_id"]),
+            method=method,
+            seed=seed,
+            ts_config=plan["ts_cfg"],
+            t0_tokens=int(plan["t0_steps"]) * gbs if method == "rel_ema" else 0,
+            order_id=str(plan["data_order"]["contract"]["contract_sha256"]),
+            init_id=init_id,
+            spec_id=spec_id,
+            n_params=n_params,
+        )
+        trainer_cfg = trainer_cfg.with_callback(
+            "raw_metrics",
+            RawComputeCallback(
+                metrics_path=Path(plan["metrics_dir"]) / str(
+                    (cfg.get("eval") or {}).get("metrics_filename", "metrics.json")
+                ),
+                payload=metrics_payload,
+                resume=resume,
+            ),
+        )
+        if method == "rel_ema":
+            trainer_cfg = trainer_cfg.with_callback("rel", RELCallback())
+
+        # --- build -------------------------------------------------------------------
+        dataset = dataset_cfg.build()
+        model = model_cfg.build(init_device="meta")
+        module_kwargs: Dict[str, Any] = {
+            "model": model,
+            "optim": train_module_cfg.optim,
+            "rank_microbatch_size": train_module_cfg.rank_microbatch_size,
+            "max_sequence_length": train_module_cfg.max_sequence_length,
+            "compile_model": train_module_cfg.compile_model,
+            "float8_config": train_module_cfg.float8_config,
+            "dp_config": train_module_cfg.dp_config,
+            "tp_config": train_module_cfg.tp_config,
+            "cp_config": train_module_cfg.cp_config,
+            "ep_config": train_module_cfg.ep_config,
+            "ac_config": train_module_cfg.ac_config,
+            "z_loss_multiplier": train_module_cfg.z_loss_multiplier,
+            "max_grad_norm": train_module_cfg.max_grad_norm,
+            "scheduler": train_module_cfg.scheduler,
+            "label_ignore_index": train_module_cfg.label_ignore_index,
+            "ts_config": ts_cfg,
+        }
+        if train_module_cfg.autocast_precision is not None:
+            module_kwargs["autocast_precision"] = train_module_cfg.autocast_precision.as_pt()
+        if train_module_cfg.state_dict_save_opts is not None:
+            module_kwargs["state_dict_save_opts"] = dist_cp_sd.StateDictOptions(
+                **train_module_cfg.state_dict_save_opts
+            )
+        if train_module_cfg.state_dict_load_opts is not None:
+            module_kwargs["state_dict_load_opts"] = dist_cp_sd.StateDictOptions(
+                **train_module_cfg.state_dict_load_opts
+            )
+        if train_module_cfg.load_key_mapping is not None:
+            module_kwargs["load_key_mapping"] = train_module_cfg.load_key_mapping
+        train_module = TokenSelectTrainModule(**module_kwargs)
+        data_loader = loader_cfg.build(dataset, dp_process_group=train_module.dp_process_group)
+
+        trainer = trainer_cfg.build(train_module=train_module, data_loader=data_loader)
+    except (AttributeError, TypeError) as e:
+        raise SystemExit(
+            "OLMo-core API mismatch while assembling the trainer. Reconcile the SEAM-marked "
+            f"call sites in build_trainer() with the pinned fork.\nOriginal error: {type(e).__name__}: {e}"
+        ) from e
+
+    return trainer
+
+
+def try_launch(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName, *, resume: bool = False) -> None:
+    """Initialize OLMo-core, build, and fit. Resume is gated by a run-fingerprint match."""
+    _prepare_run_dir(plan, resume=resume)
+    try:
+        from olmo_core.train import prepare_training_environment, teardown_training_environment  # type: ignore
+        from olmo_core.utils import seed_all  # type: ignore
+    except ImportError as e:
+        raise SystemExit(f"olmo_core not installed: {e}") from e
+
+    prepare_training_environment(seed=int(plan["init_seed"]))
+    seed_all(int(plan["init_seed"]))
+    try:
+        trainer = build_trainer(plan, cfg, method, resume=resume)
+        # Only now that the trainer is known to build do we pin the fresh-run identity,
+        # so a failed build cannot leave a stale fingerprint that blocks relaunch.
+        _commit_run_fingerprint(plan, resume=resume)
+        print(
+            json.dumps(
+                {
+                    "status": "fitting",
+                    "method": method,
+                    "init_mode": plan["init_mode"],
+                    "resume": resume,
+                    "save_folder": plan["save_folder"],
+                    "max_tokens": plan["max_tokens"],
+                    "total_steps": plan["total_steps"],
+                },
+                indent=2,
+            )
+        )
+        trainer.fit()
+    finally:
+        teardown_training_environment()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=Path, default=ROOT / "token_selection/configs/run_10b.yaml")
+    ap.add_argument("--method", choices=["full", "rel_ema"], required=True)
+    ap.add_argument(
+        "--olmo-root",
+        type=Path,
+        default=None,
+        help="Optional pinned OLMo-core checkout to verify before launch.",
+    )
+    ap.add_argument(
+        "--launch",
+        action="store_true",
+        help="Launch only when pinned public APIs satisfy frozen-order controls",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from the latest save-folder checkpoint iff its run fingerprint "
+            "(init/order/batching/budget) matches. Otherwise a fresh scratch launch."
+        ),
+    )
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+    out = resolve_output_dir(cfg, ROOT)
+    try:
+        validate_scratch_config(cfg)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.launch and args.olmo_root is None:
+        raise SystemExit(
+            "--launch requires --olmo-root pointing at the pinned OLMo-core checkout so the "
+            "revision can be verified. The installed package's revision is otherwise unchecked "
+            "and both arms must train on the identical pinned framework."
+        )
+    if args.olmo_root is not None:
+        revision = str((cfg.get("olmo_core") or {}).get("revision") or "")
+        if not revision:
+            raise SystemExit("olmo_core.revision must be set when --olmo-root is supplied")
+        try:
+            verify_olmo_revision(args.olmo_root, revision)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+    method: MethodName = args.method  # type: ignore[assignment]
+    allowed = cfg.get("methods") or ["full", "rel_ema"]
+    if method not in allowed:
+        raise SystemExit(f"method {method!r} not in config methods {allowed}")
+
+    plan = build_plan(cfg, method=method, out=out)
+    if args.launch:
+        try_launch(plan, cfg, method, resume=args.resume)
+    else:
+        print(json.dumps(plan, indent=2))
+
+
+if __name__ == "__main__":
+    main()
