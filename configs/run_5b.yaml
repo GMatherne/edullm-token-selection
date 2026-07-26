@@ -1,7 +1,6 @@
-# REL+EMA from-scratch pretraining on a single B200 — first 5B-token segment.
-# Same recipe as run_10b.yaml; budget is halved so wall-clock fits. Checkpoints are
-# kept so a later launch can raise max_tokens (e.g. to 10B) and --resume.
+# REL+EMA from-scratch pretraining on a single B200 for one full corpus epoch.
 # Pre-tokenized corpus is read from data.tokens_s3; this run writes metrics/checkpoints.
+# Started as a 5B segment; max_tokens was raised to the full usable epoch and --resume'd.
 
 run_id: rel-ema-5b-scratch-v1
 seed: 42
@@ -42,9 +41,10 @@ olmo_core:
   revision: 99e0009ed67679c90da970ec5ba439c9459e3757
 
 train:
-  # ~1192 steps at GBS=4194304. One epoch of the corpus is ~10B usable tokens, so
-  # this stays inside a single pass. Raise later and --resume to continue.
-  max_tokens: 5000000000
+  # Full usable one-epoch budget after per-shard sequence truncation
+  # (4,885,156 seqs × 2048 = 10,004,799,488). Preflight refuses anything larger.
+  # total_steps ~= 2385 at GBS=4194304. t0_steps stays pinned at 24 above.
+  max_tokens: 10004799488
   global_batch_size: 4194304
   lr: 4.0e-4
   warmup_steps: 24
@@ -57,13 +57,12 @@ train:
   compile_model: true
   cuda_visible_devices: "7"
   num_workers: 8
-  # total_steps ~= 1192; T0 = 24. Permanent + final (post_train) checkpoints kept.
+  # T0 = 24. Permanent + final (post_train) checkpoints kept for resume/eval.
   checkpoint_every_steps: 250
   checkpoint_keep_last: null
-  checkpoint_milestone_steps: [24, 125, 500, 750, 1000]
+  checkpoint_milestone_steps: [24, 125, 500, 750, 1000, 1500, 2000]
   pre_train_checkpoint: true
   save_async: true
-  # ~250 steps ≈ 2–3 h at ~38 s/step; denser while step time is still unknown under compile.
   ephemeral_checkpoint_every_steps: 125
 
 eval:
