@@ -1,11 +1,14 @@
 """Bias-corrected exponential moving-average history weights for REL scoring.
 
-FSDP / distributed note: the accumulator is built with ``p.detach().clone().zero_()`` so
-it keeps the *same* layout as the model (including ``DTensor`` shards). The in-place
-``mul_``/``add_`` in :meth:`EMAHistory.update` operate elementwise on the local shard, so
-the EMA is maintained per-rank without gathering full weights. For the history forward,
-prefer :meth:`EMAHistory.swap_to` (swaps history weights into the *training* model for one
-no-grad pass, then restores) so no second full-size module copy is needed under FSDP.
+FSDP / distributed note: under FSDP2, ``named_parameters()`` yields ``DTensor`` shards.
+Plain ``Tensor``/``DTensor`` mixes are illegal (``aten.copy_`` raises), and
+``p.detach().clone()`` on a ``DTensor`` often returns a *local* ``Tensor``, which is
+exactly what blew up the first REL-active step on the B200. The accumulator therefore
+stores local shards only, and every read/write goes through :func:`_local_tensor` so
+``update`` / ``swap_to`` / ``copy_to`` stay on the same rank-local storage the optimizer
+touches. For the history forward, prefer :meth:`EMAHistory.swap_to` (swaps history
+weights into the *training* model for one no-grad pass, then restores) so no second
+full-size module copy is needed under FSDP.
 """
 
 from __future__ import annotations
@@ -15,6 +18,19 @@ from typing import Dict, Iterable, Iterator, Mapping, MutableMapping, Optional, 
 
 import torch
 from torch import Tensor, nn
+
+
+def _local_tensor(t: Tensor) -> Tensor:
+    """Rank-local storage for a parameter or EMA buffer (identity for plain Tensors)."""
+    to_local = getattr(t, "to_local", None)
+    if callable(to_local):
+        return to_local()
+    return t
+
+
+def _copy_into_param_(dst: Tensor, src: Tensor) -> None:
+    """In-place copy that never mixes a plain Tensor with a DTensor destination."""
+    _local_tensor(dst).copy_(_local_tensor(src))
 
 
 def alpha_at_step(
@@ -68,9 +84,11 @@ class EMAHistory:
     def __init__(self, named_params: Iterable[Tuple[str, Tensor]], *, alpha: float = 0.999):
         self.alpha = float(alpha)
         self._correction = 0.0
+        # Local shards only: under FSDP2, cloning a DTensor parameter yields a plain
+        # Tensor of the shard, which is what we want to accumulate into.
         self._shadow: Dict[str, Tensor] = {}
         for name, p in named_params:
-            self._shadow[name] = p.detach().clone().zero_()
+            self._shadow[name] = _local_tensor(p).detach().clone().zero_()
 
     @classmethod
     def from_module(cls, module: nn.Module, *, alpha: float = 0.999) -> "EMAHistory":
@@ -129,7 +147,9 @@ class EMAHistory:
         if not isinstance(correction, (int, float)) or not 0.0 <= float(correction) <= 1.0:
             raise ValueError("EMA correction must be a weight in [0, 1]")
         for k, v in shadow.items():
-            self._shadow[k].copy_(v)
+            if not isinstance(v, Tensor):
+                raise TypeError(f"EMA shadow entry {k!r} must be a Tensor")
+            _copy_into_param_(self._shadow[k], v)
         self._correction = float(correction)
 
     def set_alpha(self, alpha: float) -> None:
@@ -146,8 +166,8 @@ class EMAHistory:
                     f"parameter {name!r} is absent from the EMA accumulator; seeding it now "
                     "would give it the wrong weight in the debiased average"
                 )
-            # s ← α s + (1−α) θ
-            shadow.mul_(a).add_(p.detach(), alpha=one_minus)
+            # s ← α s + (1−α) θ  (both sides are rank-local shards)
+            shadow.mul_(a).add_(_local_tensor(p).detach(), alpha=one_minus)
         self._correction = a * self._correction + one_minus
 
     @torch.no_grad()
@@ -160,7 +180,7 @@ class EMAHistory:
         correction = self._require_history()
         for name, p in module.named_parameters():
             if name in self._shadow:
-                p.copy_(self._shadow[name]).div_(correction)
+                _copy_into_param_(p, self._shadow[name] / correction)
 
     @contextlib.contextmanager
     def swap_to(self, module: nn.Module):
@@ -184,14 +204,16 @@ class EMAHistory:
             with torch.no_grad():
                 for name, p in module.named_parameters():
                     if name in self._shadow:
-                        saved[name] = p.detach().clone()
-                        p.copy_(self._shadow[name]).div_(correction)
+                        # Snapshot the local shard; restoring via _copy_into_param_ keeps
+                        # DTensor destinations happy under FSDP2.
+                        saved[name] = _local_tensor(p).detach().clone()
+                        _copy_into_param_(p, self._shadow[name] / correction)
             yield module
         finally:
             with torch.no_grad():
                 for name, p in module.named_parameters():
                     if name in saved:
-                        p.copy_(saved[name])
+                        _copy_into_param_(p, saved[name])
 
     def named_history_params(self) -> Iterator[Tuple[str, Tensor]]:
         correction = self._require_history()
@@ -208,6 +230,6 @@ class EMAHistory:
             mapping: MutableMapping[str, Tensor] = dict(source_named)
             for name, p in target.named_parameters():
                 if name in mapping:
-                    p.data.copy_(mapping[name])
+                    _copy_into_param_(p, mapping[name])
             return
         self.copy_to(target)

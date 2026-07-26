@@ -120,3 +120,49 @@ def test_legacy_ema_state_is_refused():
     ema = EMAHistory.from_module(M(), alpha=0.5)
     with pytest.raises(ValueError, match="unsupported EMA state version"):
         ema.load_state_dict({"w": torch.tensor([1.0, 1.0])})
+
+
+class _FakeDTensor:
+    """Duck-typed DTensor: ``to_local()`` returns the live shard storage."""
+
+    def __init__(self, storage: torch.Tensor):
+        self._storage = storage
+
+    def to_local(self) -> torch.Tensor:
+        return self._storage
+
+    @property
+    def requires_grad(self) -> bool:
+        return bool(self._storage.requires_grad)
+
+
+class DTensorParamModule(nn.Module):
+    def __init__(self, value=(1.0, 1.0)):
+        super().__init__()
+        self._w = nn.Parameter(torch.tensor(list(value)))
+
+    def named_parameters(self, prefix="", recurse=True):  # noqa: ARG002
+        # Wrap the Parameter (not .data): .data has requires_grad=False, which would
+        # drop the param from EMAHistory.from_module's filter.
+        yield "w", _FakeDTensor(self._w)
+
+
+def test_swap_to_works_when_parameters_look_like_dtensors():
+    """FSDP2 params are DTensors; cloning them yields plain local Tensors.
+
+    The B200 smoke died on ``p.copy_(saved)`` mixing the two. Operating through
+    ``to_local()`` keeps every copy on rank-local storage.
+    """
+    m = DTensorParamModule((1.0, 1.0))
+    ema = EMAHistory.from_module(m, alpha=0.5)
+    assert "w" in ema.shadow
+    m._w.data.fill_(3.0)
+    ema.update_module(m, alpha=0.5)
+    m._w.data.fill_(5.0)
+    ema.update_module(m, alpha=0.5)
+    expected = torch.full((2,), 13 / 3)
+
+    m._w.data.fill_(7.0)
+    with ema.swap_to(m):
+        assert torch.allclose(m._w.data, expected)
+    assert torch.allclose(m._w.data, torch.tensor([7.0, 7.0]))
