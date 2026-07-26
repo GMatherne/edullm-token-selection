@@ -73,6 +73,31 @@ def test_matching_resume_is_allowed(tmp_path):
     _prepare_run_dir(plan, resume=True)  # must not raise
 
 
+def test_resume_allows_max_tokens_extension(tmp_path):
+    """A finished 5B segment can continue by raising max_tokens and --resume."""
+    save = tmp_path / "rel_ema"
+    plan = _plan(save)
+    plan["max_tokens"] = 5_000_000_000
+    _launch_fresh(plan)
+
+    extended = copy.deepcopy(plan)
+    extended["max_tokens"] = 10_000_000_000
+    _prepare_run_dir(extended, resume=True)
+    _commit_run_fingerprint(extended, resume=True)
+    prior = json.loads((save / "run_fingerprint.json").read_text(encoding="utf-8"))
+    assert prior["max_tokens"] == 10_000_000_000
+
+
+def test_resume_refuses_max_tokens_decrease(tmp_path):
+    save = tmp_path / "rel_ema"
+    plan = _plan(save)
+    _launch_fresh(plan)
+    shrunk = copy.deepcopy(plan)
+    shrunk["max_tokens"] = plan["max_tokens"] // 2
+    with pytest.raises(SystemExit, match="Refusing to resume"):
+        _prepare_run_dir(shrunk, resume=True)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

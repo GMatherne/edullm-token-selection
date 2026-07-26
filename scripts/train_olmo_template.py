@@ -204,7 +204,7 @@ def build_plan(
         "s3_checkpoints": s3_uri(cfg, method, bucket_key="checkpoint_bucket"),
         "torchrun_example": (
             "CUDA_VISIBLE_DEVICES=7 ./token_selection/scripts/launch_gpu7.sh "
-            f"token_selection/configs/run_10b.yaml {method}"
+            f"token_selection/configs/run_5b.yaml {method}"
         ),
         "cuda_visible_devices": str((cfg.get("train") or {}).get("cuda_visible_devices") or ""),
         "notes": [
@@ -295,26 +295,47 @@ def _prepare_run_dir(plan: Dict[str, Any], *, resume: bool) -> None:
                 "nothing to resume. Launch without --resume to start the run."
             )
         prior = json.loads(fingerprint_path.read_text(encoding="utf-8"))
-        if prior != current:
-            diffs = sorted(k for k in current if prior.get(k) != current.get(k))
-            raise SystemExit(
-                "Refusing to resume: the run identity changed since the checkpoint was "
-                f"written (differing fields: {diffs}). Resuming would break the matched "
-                "REL-vs-full comparison."
-            )
-        return
+        if prior == current:
+            return
+        # Allow extending the token budget after a completed (or interrupted) segment so
+        # a 5B run can later continue to 10B from the same checkpoints. Everything else
+        # that defines the experiment must still match.
+        diffs = sorted(k for k in set(prior) | set(current) if prior.get(k) != current.get(k))
+        if diffs == ["max_tokens"] and int(current["max_tokens"]) > int(prior["max_tokens"]):
+            return
+        raise SystemExit(
+            "Refusing to resume: the run identity changed since the checkpoint was "
+            f"written (differing fields: {diffs}). Resuming would break the matched "
+            "REL-vs-full comparison. Extending max_tokens upward is the only allowed "
+            "identity change on --resume."
+        )
     # Fresh scratch launch: the folder must be empty (the fingerprint is written later).
     _assert_fresh_save_folder(save_folder)
     save_folder.mkdir(parents=True, exist_ok=True)
 
 
 def _commit_run_fingerprint(plan: Dict[str, Any], *, resume: bool) -> None:
-    """Persist the fresh-launch identity once the trainer is known to build."""
+    """Persist the run identity once the trainer is known to build.
+
+    On resume, rewrite when ``max_tokens`` was extended so a later resume still matches.
+    """
+    fingerprint_path = _fingerprint_path(plan)
+    current = _run_fingerprint(plan)
     if resume:
+        if fingerprint_path.exists():
+            prior = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+            if prior == current:
+                return
+            if (
+                sorted(k for k in set(prior) | set(current) if prior.get(k) != current.get(k))
+                == ["max_tokens"]
+                and int(current["max_tokens"]) > int(prior["max_tokens"])
+            ):
+                fingerprint_path.write_text(
+                    json.dumps(current, indent=2), encoding="utf-8"
+                )
         return
-    _fingerprint_path(plan).write_text(
-        json.dumps(_run_fingerprint(plan), indent=2), encoding="utf-8"
-    )
+    fingerprint_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
 
 def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName, *, resume: bool = False):
@@ -413,11 +434,13 @@ def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName,
         scheduler = CosWithWarmup(warmup_steps=warmup_steps)
 
         rank_mbz = int(cfg.get("train", {}).get("rank_microbatch_size", seq_len))
+        compile_model = bool(cfg.get("train", {}).get("compile_model", False))
         train_module_cfg = TransformerTrainModuleConfig(
             rank_microbatch_size=rank_mbz,
             max_sequence_length=seq_len,
             optim=optim_cfg,
             scheduler=scheduler,
+            compile_model=compile_model,
             dp_config=TransformerDataParallelConfig(
                 name=DataParallelType.fsdp,
                 param_dtype=DType.bfloat16,

@@ -27,14 +27,22 @@ def resolve_output_dir(cfg: Dict[str, Any], root: Path | None = None) -> Path:
 
 
 def derive_steps(cfg: Dict[str, Any]) -> Tuple[int, int]:
-    """Return ``(total_steps, t0_steps)`` from max_tokens / GBS / t0_frac."""
+    """Return ``(total_steps, t0_steps)`` from max_tokens / GBS / t0_frac.
+
+    An explicit ``t0_steps`` in the config wins over ``t0_frac``. Pin it when a run
+    may later extend ``max_tokens`` (e.g. 5B then continue to 10B) so the REL warmup
+    boundary stays fixed across the resume.
+    """
     max_tokens = int(cfg["train"]["max_tokens"])
     gbs = int(cfg["train"]["global_batch_size"])
     if gbs <= 0:
         raise ValueError("train.global_batch_size must be > 0")
     total_steps = max(1, max_tokens // gbs)
-    t0_frac = float(cfg.get("t0_frac", 0.02))
-    t0_steps = max(1, int(round(total_steps * t0_frac)))
+    if cfg.get("t0_steps") is not None:
+        t0_steps = max(1, int(cfg["t0_steps"]))
+    else:
+        t0_frac = float(cfg.get("t0_frac", 0.02))
+        t0_steps = max(1, int(round(total_steps * t0_frac)))
     t0_steps = min(t0_steps, total_steps)
     return total_steps, t0_steps
 
