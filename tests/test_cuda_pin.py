@@ -18,40 +18,40 @@ def test_pin_requires_config(monkeypatch):
 def test_pin_rejects_multi_index(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     with pytest.raises(SystemExit, match="single integer"):
-        pin_cuda_visible_devices({"train": {"cuda_visible_devices": "0,7"}})
+        pin_cuda_visible_devices({"train": {"cuda_visible_devices": "0,1"}})
 
 
 def test_pin_rejects_conflicting_env(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     with pytest.raises(SystemExit, match="conflicting pin"):
-        pin_cuda_visible_devices({"train": {"cuda_visible_devices": "7"}})
+        pin_cuda_visible_devices({"train": {"cuda_visible_devices": "1"}})
 
 
 def test_pin_sets_env_and_accepts_idle_gpu(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     def fake_check_output(cmd, text=True, stderr=None):  # noqa: ARG001
-        assert cmd[:3] == ["nvidia-smi", "-i", "7"]
-        return "7, GPU-deadbeef, 0\n"
+        assert cmd[:3] == ["nvidia-smi", "-i", "0"]
+        return "0, GPU-deadbeef, 0\n"
 
     monkeypatch.setattr(
         "token_selection.scripts.train_olmo_template.subprocess.check_output",
         fake_check_output,
     )
-    pinned = pin_cuda_visible_devices({"train": {"cuda_visible_devices": "7"}})
-    assert pinned == "7"
-    assert os.environ["CUDA_VISIBLE_DEVICES"] == "7"
+    pinned = pin_cuda_visible_devices({"train": {"cuda_visible_devices": "0"}})
+    assert pinned == "0"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
 
 
 def test_pin_refuses_busy_gpu(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     def fake_check_output(cmd, text=True, stderr=None):  # noqa: ARG001
-        return "7, GPU-deadbeef, 4096\n"
+        return "0, GPU-deadbeef, 4096\n"
 
     monkeypatch.setattr(
         "token_selection.scripts.train_olmo_template.subprocess.check_output",
         fake_check_output,
     )
     with pytest.raises(SystemExit, match="not idle"):
-        pin_cuda_visible_devices({"train": {"cuda_visible_devices": "7"}})
+        pin_cuda_visible_devices({"train": {"cuda_visible_devices": "0"}})

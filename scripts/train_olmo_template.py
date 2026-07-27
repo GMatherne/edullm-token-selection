@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OLMo-core scratch entry for ``rel_ema`` (and optional ``full``) on local tokens/order.
+"""OLMo-core scratch entry for ``rel_ema``, ``rho_excess``, ``middle_ppl``, and optional ``full``.
 
 Requires edu-llm/OLMo-core installed. Builds trainer configs from the experiment
 YAML and documents the torchrun launch. ``--launch`` fails closed if the requested
@@ -38,7 +38,8 @@ from token_selection.scripts.experiment_contract import (
     verify_olmo_revision,
 )
 
-MethodName = Literal["full", "rel_ema"]
+MethodName = Literal["full", "rel_ema", "rho_excess", "middle_ppl"]
+_SELECTING = ("rel_ema", "rho_excess", "middle_ppl")
 
 # On a shared multi-GPU host, launching without an explicit pin would default to
 # physical GPU 0. Refuse that rather than compete with whatever owns the other devices.
@@ -57,7 +58,7 @@ def pin_cuda_visible_devices(cfg: Dict[str, Any]) -> str:
         raise SystemExit(
             "train.cuda_visible_devices is required for --launch. On a multi-GPU host "
             "omitting it would let torch grab GPU 0. Set it to the idle physical index "
-            '(e.g. "7") or use scripts/launch_gpu7.sh.'
+            "(e.g. \"0\" or \"3\") for this host."
         )
     pinned = str(raw).strip()
     if "," in pinned or not pinned.isdigit():
@@ -163,6 +164,8 @@ def build_plan(
     warmup_steps = max(
         1, int((cfg.get("train") or {}).get("warmup_steps", round(0.01 * total_steps)))
     )
+    uses_selection = method in _SELECTING
+    ref_path = str(((cfg.get("reference") or {}).get("load_path")) or "")
 
     return {
         "run_id": cfg["run_id"],
@@ -171,6 +174,7 @@ def build_plan(
         "init_mode": "scratch",
         "init_seed": int((cfg.get("model") or {}).get("init_seed", cfg["seed"])),
         "load_path": None,
+        "reference_load_path": ref_path if method == "rho_excess" else "",
         "model_name": cfg["model"]["name"],
         "model_arch": str(arch),
         "olmo_revision": olmo_revision,
@@ -182,7 +186,7 @@ def build_plan(
         "lr": float(cfg["train"]["lr"]),
         "warmup_steps": warmup_steps,
         "total_steps": total_steps,
-        "t0_steps": t0_steps if method == "rel_ema" else 0,
+        "t0_steps": t0_steps if uses_selection else 0,
         "ts_cfg": ts_cfg.__dict__,
         "token_paths": paths,
         "token_budget": token_budget,
@@ -203,15 +207,17 @@ def build_plan(
         "s3_tokens": resolve_tokens_s3(cfg),
         "s3_checkpoints": s3_uri(cfg, method, bucket_key="checkpoint_bucket"),
         "torchrun_example": (
-            "CUDA_VISIBLE_DEVICES=7 ./token_selection/scripts/launch_gpu7.sh "
-            f"token_selection/configs/run_5b.yaml {method}"
+            "CUDA_VISIBLE_DEVICES=<gpu> python -m torch.distributed.run --standalone "
+            "--nproc_per_node=1 -m token_selection.scripts.train_olmo_template "
+            f"--config <this-arm-yaml> --method {method} "
+            "--olmo-root /path/to/OLMo-core --launch"
         ),
         "cuda_visible_devices": str((cfg.get("train") or {}).get("cuda_visible_devices") or ""),
         "notes": [
             "TokenSelectTrainModule with NumpyDataLoaderConfig seed + order contract.",
             "Tokens come from data.tokens_s3; order is produced locally by freeze_order.",
             "Scratch initialization never resumes an existing save folder or loads optimizer/trainer state.",
-            "Launch pins train.cuda_visible_devices (physical GPU 7) and refuses a busy device.",
+            "Launch pins train.cuda_visible_devices and refuses a busy device.",
         ],
     }
 
@@ -244,14 +250,20 @@ def _run_fingerprint(plan: Dict[str, Any]) -> Dict[str, Any]:
     """Identity that must be unchanged for a resume to be scientifically valid.
 
     It pins initialization (arch + seed + name + tokenizer + OLMo revision), the frozen
-    data order, batching, the token budget, the learning rate, and the REL selection
-    schedule (k / EMA alphas / warmup). A resume that changed any of
+    data order, batching, the token budget, the learning rate, and the selection
+    schedule (k / EMA alphas / warmup / reference path). A resume that changed any of
     these would silently continue a *different* experiment, so we refuse it. The checkpoint
     only carries EMA/optimizer state, not these knobs, which is exactly why they must be
     re-pinned here rather than trusted to the restored state.
+
+    When ``reference_load_path`` is set (RHO), also pin ``reference_content_sha256`` so
+    replacing the file at the same path cannot silently resume a different reference.
+    The hash key is omitted when the path is empty so live REL fingerprints stay
+    backward-compatible.
     """
     ts_cfg = plan.get("ts_cfg") or {}
-    return {
+    ref_path = str(plan.get("reference_load_path") or "")
+    fingerprint: Dict[str, Any] = {
         "run_id": str(plan["run_id"]),
         "method": str(plan["method"]),
         "seed": int(plan["seed"]),
@@ -269,8 +281,24 @@ def _run_fingerprint(plan: Dict[str, Any]) -> Dict[str, Any]:
         "rel_k": float(ts_cfg.get("k", 0.0)),
         "rel_alpha_start": float(ts_cfg.get("alpha_start", 0.0)),
         "rel_alpha_end": float(ts_cfg.get("alpha_end", 0.0)),
+        "reference_load_path": ref_path,
         "order_contract_sha256": str(plan["data_order"]["contract"]["contract_sha256"]),
     }
+    if ref_path:
+        # Prefer an explicit precomputed hash (tests); otherwise hash the local file.
+        content_sha = plan.get("reference_content_sha256")
+        if not content_sha:
+            path = Path(ref_path)
+            if not path.exists():
+                raise SystemExit(
+                    f"reference.load_path {ref_path!r} does not exist; cannot fingerprint "
+                    "the frozen RHO reference."
+                )
+            from token_selection.scripts.experiment_contract import sha256_file
+
+            content_sha = sha256_file(path)
+        fingerprint["reference_content_sha256"] = str(content_sha)
+    return fingerprint
 
 
 def _fingerprint_path(plan: Dict[str, Any]) -> Path:
@@ -529,7 +557,7 @@ def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName,
             method=method,
             seed=seed,
             ts_config=plan["ts_cfg"],
-            t0_tokens=int(plan["t0_steps"]) * gbs if method == "rel_ema" else 0,
+            t0_tokens=int(plan["t0_steps"]) * gbs if method in _SELECTING else 0,
             order_id=str(plan["data_order"]["contract"]["contract_sha256"]),
             init_id=init_id,
             spec_id=spec_id,
@@ -545,7 +573,7 @@ def build_trainer(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName,
                 resume=resume,
             ),
         )
-        if method == "rel_ema":
+        if method in _SELECTING:
             trainer_cfg = trainer_cfg.with_callback("rel", RELCallback())
 
         # --- build -------------------------------------------------------------------
@@ -641,7 +669,11 @@ def try_launch(plan: Dict[str, Any], cfg: Dict[str, Any], method: MethodName, *,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, default=ROOT / "token_selection/configs/run_10b.yaml")
-    ap.add_argument("--method", choices=["full", "rel_ema"], required=True)
+    ap.add_argument(
+        "--method",
+        choices=["full", "rel_ema", "rho_excess", "middle_ppl"],
+        required=True,
+    )
     ap.add_argument(
         "--olmo-root",
         type=Path,
@@ -665,7 +697,7 @@ def main() -> None:
     cfg = load_config(args.config)
     out = resolve_output_dir(cfg, ROOT)
     try:
-        validate_scratch_config(cfg)
+        validate_scratch_config(cfg, method=args.method)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if args.launch and args.olmo_root is None:
@@ -683,7 +715,7 @@ def main() -> None:
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
     method: MethodName = args.method  # type: ignore[assignment]
-    allowed = cfg.get("methods") or ["full", "rel_ema"]
+    allowed = cfg.get("methods") or ["full", "rel_ema", "rho_excess", "middle_ppl"]
     if method not in allowed:
         raise SystemExit(f"method {method!r} not in config methods {allowed}")
 

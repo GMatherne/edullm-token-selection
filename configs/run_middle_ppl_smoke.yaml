@@ -1,0 +1,49 @@
+# Local TinyLM smoke for middle_ppl plumbing (not a hypothesis test).
+# No EMA / reference; selection reuses the train-forward CE after t0 warmup.
+run_id: middle-ppl-smoke-v1
+seed: 42
+output_dir: token_selection/data/middle_ppl_smoke
+
+methods: [middle_ppl]
+
+k: 0.6
+t0_frac: 0.02
+alpha_start: 0.999
+alpha_end: 0.995
+
+smoke:
+  n_docs: 64
+  doc_len: 64
+  sequence_length: 64
+  vocab_size: 128
+  train_steps: 20
+  batch_size: 4
+  lr: 0.001
+
+data:
+  tokenizer: allenai/OLMo-2-0425-1B
+  sequence_length: 2048
+
+s3:
+  dataset_bucket: edullm-dataset-olmo
+  checkpoint_bucket: edullm-checkpoints
+  prefix: token-selection/middle-ppl-smoke-v1
+  profile: sbsandbox
+
+model:
+  name: allenai/OLMo-2-0425-1B
+  init_mode: scratch
+  init_seed: 42
+  load_path: null
+
+train:
+  max_tokens: 1000000
+  global_batch_size: 65536
+  lr: 4.0e-4
+  data_loader_seed: 42
+  data_loader_initial_epoch: 0
+  data_loader_chunk_size: 1
+
+eval:
+  block_unit: sequence
+  metrics_filename: metrics.json

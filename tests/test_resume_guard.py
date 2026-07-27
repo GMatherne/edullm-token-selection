@@ -37,6 +37,7 @@ def _plan(save_folder) -> dict:
         "warmup_steps": 24,
         "t0_steps": 48,
         "ts_cfg": {"k": 0.6, "alpha_start": 0.999, "alpha_end": 0.995},
+        "reference_load_path": "",
         "data_order": {"contract": {"contract_sha256": "order-sha"}},
     }
 
@@ -111,11 +112,24 @@ def test_resume_refuses_max_tokens_decrease(tmp_path):
         ("tokenizer", "some/other-tokenizer"),
         ("olmo_revision", "deadbeef"),
         ("rel_k_via", 0.4),  # mutate nested ts_cfg["k"]
+        ("reference_load_path", "/other/ref.pt"),
+        ("reference_content_sha256", "different-ref-bytes"),
     ],
 )
 def test_resume_refused_on_identity_change(tmp_path, field, value):
     save = tmp_path / "rel_ema"
     base = _plan(save)
+    if field in ("reference_load_path", "reference_content_sha256"):
+        # RHO fingerprints pin both path and content hash; seed a matching RHO identity.
+        ref = tmp_path / "ref.pt"
+        import torch
+
+        torch.save({"w": torch.tensor([1.0])}, ref)
+        base["method"] = "rho_excess"
+        base["reference_load_path"] = str(ref)
+        base["reference_content_sha256"] = "abc123"
+        save = tmp_path / "rho_excess"
+        base["save_folder"] = str(save)
     _launch_fresh(base)
 
     changed = copy.deepcopy(base)
@@ -127,6 +141,35 @@ def test_resume_refused_on_identity_change(tmp_path, field, value):
         changed[field] = value
     with pytest.raises(SystemExit, match="Refusing to resume"):
         _prepare_run_dir(changed, resume=True)
+
+
+def test_rho_fingerprint_pins_reference_bytes(tmp_path):
+    """Replacing the file at the same path must refuse --resume."""
+    import torch
+
+    ref = tmp_path / "ref.pt"
+    torch.save({"w": torch.tensor([1.0, 2.0])}, ref)
+    save = tmp_path / "rho_excess"
+    plan = _plan(save)
+    plan["method"] = "rho_excess"
+    plan["reference_load_path"] = str(ref)
+    _launch_fresh(plan)
+
+    fp = json.loads((save / "run_fingerprint.json").read_text(encoding="utf-8"))
+    assert "reference_content_sha256" in fp
+    assert fp["reference_load_path"] == str(ref)
+
+    torch.save({"w": torch.tensor([9.0, 8.0])}, ref)  # same path, different bytes
+    with pytest.raises(SystemExit, match="Refusing to resume"):
+        _prepare_run_dir(plan, resume=True)
+
+
+def test_rel_fingerprint_omits_reference_content_hash(tmp_path):
+    """Live REL resumes must stay compatible: no RHO-only hash key when path is empty."""
+    fp = _run_fingerprint(_plan(tmp_path / "rel_ema"))
+    assert fp["reference_load_path"] == ""
+    assert "reference_content_sha256" not in fp
+
 
 
 def test_resume_refused_without_prior_fingerprint(tmp_path):
@@ -231,5 +274,6 @@ def test_fingerprint_covers_the_fairness_critical_fields(tmp_path):
         "rel_k",
         "rel_alpha_start",
         "rel_alpha_end",
+        "reference_load_path",
     ):
         assert key in fp

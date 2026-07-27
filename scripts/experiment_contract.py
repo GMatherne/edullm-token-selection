@@ -80,8 +80,15 @@ def resolve_config_path(cfg: Mapping[str, Any], path_value: str | Path, *, root:
 
 def validate_scratch_config(
     cfg: Mapping[str, Any],
+    *,
+    method: Optional[str] = None,
 ) -> None:
-    """Reject any configuration that would accidentally become continued pretraining."""
+    """Reject any configuration that would accidentally become continued pretraining.
+
+    When ``method='rho_excess'`` (or it is the only configured method), also require a
+    non-null ``reference.load_path``. Smoke configs may omit the path and supply an
+    in-memory frozen twin instead.
+    """
     model = cfg.get("model") or {}
     if model.get("init_mode") != "scratch":
         raise ValueError("model.init_mode must be 'scratch' for this REL-vs-full experiment")
@@ -94,6 +101,20 @@ def validate_scratch_config(
     train = cfg.get("train") or {}
     if int(train.get("data_loader_seed", run_seed)) != run_seed:
         raise ValueError("train.data_loader_seed must match the shared experiment seed")
+
+    resolved = method
+    if resolved is None:
+        methods = cfg.get("methods") or []
+        if len(methods) == 1:
+            resolved = str(methods[0])
+    if resolved == "rho_excess" and not cfg.get("smoke"):
+        ref = cfg.get("reference") or {}
+        load_path = ref.get("load_path")
+        if load_path is None or str(load_path).strip() in ("", "null", "None", "REPLACE_ME"):
+            raise ValueError(
+                "rho_excess requires reference.load_path (local path to a frozen reference "
+                "checkpoint). Sync the checkpoint locally first if it lives on S3."
+            )
 
 
 def validate_token_manifest(

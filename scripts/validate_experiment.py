@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed preflight for a REL-vs-full experiment launch."""
+"""Fail-closed preflight for a token-selection experiment launch."""
 
 from __future__ import annotations
 
@@ -39,7 +39,23 @@ def main() -> None:
 
     cfg = load_config(args.config)
     out = resolve_output_dir(cfg, ROOT)
-    validate_scratch_config(cfg)
+    methods = cfg.get("methods") or []
+    method = str(methods[0]) if len(methods) == 1 else None
+    validate_scratch_config(cfg, method=method)
+
+    # RHO production configs must point at a real local reference *before* launch.
+    # validate_scratch_config only rejects null/REPLACE_ME; existence is checked here so
+    # a typo cannot pass preflight and then strand a run_fingerprint after --launch.
+    if method == "rho_excess" and not cfg.get("smoke"):
+        ref_raw = str(((cfg.get("reference") or {}).get("load_path")) or "")
+        ref_path = Path(ref_raw)
+        if not ref_path.is_absolute():
+            ref_path = ROOT / ref_path
+        if not ref_path.exists():
+            raise SystemExit(
+                f"rho_excess reference.load_path does not exist: {ref_raw!r} "
+                f"(resolved {ref_path}). Sync the checkpoint locally first."
+            )
 
     try:
         tokens_s3 = resolve_tokens_s3(cfg)

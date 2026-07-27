@@ -1,7 +1,8 @@
 """Token-selection train helpers + optional OLMo-core TrainModule subclass.
 
-Supports ``method=full`` (all valid tokens) and ``method=rel_ema`` (REL + EMA).
-When ``olmo_core`` is not installed, ``TokenSelectLoop`` still runs for local smokes.
+Supports ``method=full``, ``rel_ema`` (REL + EMA), ``rho_excess`` (frozen-ref
+excess loss), and ``middle_ppl`` (middle-k by current CE). When ``olmo_core`` is
+not installed, ``TokenSelectLoop`` still runs for local smokes.
 """
 
 from __future__ import annotations
@@ -9,13 +10,15 @@ from __future__ import annotations
 import contextlib
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Literal, Mapping, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterator, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .ema import EMAHistory, alpha_at_step
+from .frozen_ref import FrozenReference
 from .scorers import MethodName, build_mask
 
 
@@ -29,10 +32,87 @@ class TokenSelectConfig:
     alpha_end: float = 0.995
     label_ignore_index: int = -100
     seed: int = 42
+    # Production RHO: local path to a reference checkpoint (fingerprinted). Smoke may
+    # omit this and pass an in-memory FrozenReference into TokenSelectState instead.
+    reference_load_path: Optional[str] = None
 
     @property
     def uses_rel(self) -> bool:
         return self.method == "rel_ema"
+
+    @property
+    def uses_rho(self) -> bool:
+        return self.method == "rho_excess"
+
+    @property
+    def uses_middle_ppl(self) -> bool:
+        return self.method == "middle_ppl"
+
+    @property
+    def uses_selection(self) -> bool:
+        return self.uses_rel or self.uses_rho or self.uses_middle_ppl
+
+    @property
+    def needs_scoring_forward(self) -> bool:
+        """True when selection needs a second no-grad forward (EMA history or frozen ref)."""
+        return self.uses_rel or self.uses_rho
+
+
+def load_reference_state_dict(path: Union[str, Path]) -> Dict[str, Tensor]:
+    """Load a flat parameter state dict from a local reference checkpoint.
+
+    Accepts a ``.pt``/``.pth`` file (raw state dict, or a dict with ``model`` /
+    ``state_dict`` / ``model_state_dict``) or a directory containing one of those
+    filenames. Remote ``s3://`` URIs must be synced to a local path before launch.
+    """
+    raw = str(path)
+    if raw.startswith("s3://"):
+        raise ValueError(
+            f"reference.load_path={raw!r} is remote; sync the checkpoint to a local "
+            "path and point reference.load_path at that file before launch."
+        )
+    p = Path(raw)
+    if p.is_dir():
+        candidates = [
+            p / "model.pt",
+            p / "model.pth",
+            p / "pytorch_model.bin",
+            p / "model.safetensors",
+        ]
+        found = next((c for c in candidates if c.exists()), None)
+        if found is None:
+            raise FileNotFoundError(
+                f"No model.pt / model.pth under reference directory {p}"
+            )
+        p = found
+    if not p.exists():
+        raise FileNotFoundError(f"reference checkpoint not found: {p}")
+    if p.suffix == ".safetensors":
+        raise ValueError(
+            f"reference checkpoint {p} is safetensors; convert to a .pt state dict "
+            "or add safetensors support before launch."
+        )
+    try:
+        obj = torch.load(p, map_location="cpu", weights_only=False)
+    except TypeError:
+        obj = torch.load(p, map_location="cpu")
+    if isinstance(obj, Mapping) and all(isinstance(v, Tensor) for v in obj.values()):
+        return {str(k): v for k, v in obj.items()}
+    if not isinstance(obj, Mapping):
+        raise TypeError(f"reference checkpoint {p} is not a state-dict mapping")
+    for key in ("model_state_dict", "state_dict", "model"):
+        inner = obj.get(key)
+        if isinstance(inner, Mapping) and inner and all(
+            isinstance(v, Tensor) for v in inner.values()
+        ):
+            return {str(k): v for k, v in inner.items()}
+    # Some checkpoints nest tensors under a single prefix; accept if every value is a Tensor.
+    if obj and all(isinstance(v, Tensor) for v in obj.values()):
+        return {str(k): v for k, v in obj.items()}
+    raise TypeError(
+        f"Could not find a parameter state dict in {p}; expected a flat Tensor "
+        "mapping or a dict with model / state_dict / model_state_dict."
+    )
 
 
 def per_token_ce(
@@ -81,18 +161,19 @@ def masked_ce_from_token_ce(token_ce: Tensor, label_mask: Tensor) -> Tuple[Tenso
 
 
 class TokenSelectState:
-    """Mutable run state: step counter + optional EMA history (REL only).
+    """Mutable run state: step counter + REL EMA and/or RHO frozen reference.
 
     The EMA accumulates from step 0, including through warmup, but it is debiased so the
     random initialization is excluded from the average (see :class:`EMAHistory`). Warmup
-    controls when REL is *read*, not what the history contains, so the two mechanisms are
-    independent: warmup keeps gradients on all tokens while the current model is untrained,
-    and the debiasing keeps the history model on the trained-weight manifold.
+    controls when selection is *read*, not what the history contains.
 
-    ``build_history_module`` controls how the history forward is served:
+    ``build_history_module`` controls how the REL history forward is served:
     - ``True`` (default, single-process / smoke): keep a deep-copied ``history_model``.
     - ``False`` (FSDP / OLMo-core): keep only the EMA shadow and run the history forward
       via :meth:`EMAHistory.swap_to` on the training model (no second full-size copy).
+
+    RHO always uses a :class:`FrozenReference` shadow + ``swap_to``. Pass ``frozen_ref``
+    directly, or set ``cfg.reference_load_path`` to load from disk.
     """
 
     def __init__(
@@ -101,12 +182,14 @@ class TokenSelectState:
         model: nn.Module,
         *,
         build_history_module: bool = True,
+        frozen_ref: Optional[FrozenReference] = None,
     ):
         self.cfg = cfg
         self.step = 0
         self.tokens_seen = 0
         self.ema: Optional[EMAHistory] = None
         self.history_model: Optional[nn.Module] = None
+        self.frozen_ref: Optional[FrozenReference] = None
         if cfg.uses_rel:
             self.ema = EMAHistory.from_module(model, alpha=cfg.alpha_start)
             if build_history_module:
@@ -114,6 +197,16 @@ class TokenSelectState:
                 self.history_model.eval()
                 for p in self.history_model.parameters():
                     p.requires_grad_(False)
+        if cfg.uses_rho:
+            if frozen_ref is not None:
+                self.frozen_ref = frozen_ref
+            elif cfg.reference_load_path:
+                weights = load_reference_state_dict(cfg.reference_load_path)
+                self.frozen_ref = FrozenReference.from_state_dict(model, weights)
+            else:
+                raise ValueError(
+                    "rho_excess requires frozen_ref=... or TokenSelectConfig.reference_load_path"
+                )
 
     def current_alpha(self) -> float:
         if not self.cfg.uses_rel:
@@ -127,7 +220,7 @@ class TokenSelectState:
         )
 
     def in_warmup(self) -> bool:
-        if not self.cfg.uses_rel:
+        if not self.cfg.uses_selection:
             return False
         return self.step < self.cfg.t0_steps
 
@@ -160,10 +253,12 @@ class TokenSelectState:
         }
         if self.ema is not None:
             state["ema"] = self.ema.state_dict()
+        if self.frozen_ref is not None:
+            state["frozen_ref"] = self.frozen_ref.state_dict()
         return state
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore REL bookkeeping, rejecting partial or incompatible states."""
+        """Restore selection bookkeeping, rejecting partial or incompatible states."""
         try:
             step = int(state["step"])
             tokens_seen = int(state.get("tokens_seen", 0))
@@ -174,30 +269,49 @@ class TokenSelectState:
 
         if self.ema is None:
             if "ema" in state:
-                raise ValueError("received EMA checkpoint state for method='full'")
+                raise ValueError(
+                    f"received EMA checkpoint state for method={self.cfg.method!r}"
+                )
         else:
             ema_state = state.get("ema")
             if not isinstance(ema_state, Mapping):
                 raise ValueError("REL checkpoint state is missing EMA weights")
             self.ema.load_state_dict(ema_state)
 
+        if self.frozen_ref is None:
+            if "frozen_ref" in state:
+                raise ValueError(
+                    f"received frozen-ref checkpoint state for method={self.cfg.method!r}"
+                )
+        else:
+            ref_state = state.get("frozen_ref")
+            if isinstance(ref_state, Mapping):
+                self.frozen_ref.load_state_dict(ref_state)
+            elif not self.cfg.reference_load_path:
+                raise ValueError("RHO checkpoint state is missing frozen reference weights")
+
         self.step = step
         self.tokens_seen = tokens_seen
         if self.ema is not None:
-            # The alpha schedule is derived from the restored optimizer-step count.
             self.ema.set_alpha(self.current_alpha())
 
 
 class TokenSelectLoop:
-    """Minimal train step for smoke / unit use (``full`` or ``rel_ema``).
+    """Minimal train step for smoke / unit use (all supported methods).
 
     Expects ``model(input_ids) -> logits [B,T,V]``.
     """
 
-    def __init__(self, model: nn.Module, cfg: TokenSelectConfig):
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: TokenSelectConfig,
+        *,
+        frozen_ref: Optional[FrozenReference] = None,
+    ):
         self.model = model
         self.cfg = cfg
-        self.state = TokenSelectState(cfg, model)
+        self.state = TokenSelectState(cfg, model, frozen_ref=frozen_ref)
 
     def train_step(self, input_ids: Tensor) -> Dict[str, Any]:
         cfg = self.cfg
@@ -205,21 +319,35 @@ class TokenSelectLoop:
         warmup = st.in_warmup()
         alpha = st.current_alpha()
         rel_active = bool(cfg.uses_rel and not warmup)
+        rho_active = bool(cfg.uses_rho and not warmup)
+        middle_active = bool(cfg.uses_middle_ppl and not warmup)
+        select_active = rel_active or rho_active or middle_active
+        scoring_forward = rel_active or rho_active
 
         valid = torch.ones_like(input_ids, dtype=torch.bool)
         valid[:, 0] = False
 
+        current_loss: Optional[Tensor] = None
+        history_loss: Optional[Tensor] = None
+        reference_loss: Optional[Tensor] = None
+        scoring_tokens = 0
+
+        # RHO must score *before* the grad-enabled forward: swap_to mutates parameters
+        # in place, which would invalidate autograd if the train forward ran first.
+        if rho_active:
+            assert st.frozen_ref is not None
+            with torch.no_grad():
+                with st.frozen_ref.swap_to(self.model):
+                    logits_r = self.model(input_ids)
+                    reference_loss = per_token_ce(logits_r, input_ids)
+            scoring_tokens += int(input_ids.numel())
+
         # Folded: ONE training forward (with grad) and ONE cross-entropy over its logits.
-        # The per-token CE serves both the current-model REL score (detached) and the
-        # selected-token objective, so a step costs history + train (2 forwards), not 3,
-        # and one pass over the logits, not two.
+        # REL / middle_ppl reuse that CE as the current-model score (detached).
         self.model.train()
         logits = self.model(input_ids)
         token_ce = per_token_ce(logits, input_ids)
 
-        current_loss: Optional[Tensor] = None
-        history_loss: Optional[Tensor] = None
-        scoring_tokens = 0
         if rel_active:
             current_loss = token_ce.detach()
             st.sync_history_model(self.model)
@@ -227,13 +355,16 @@ class TokenSelectLoop:
             with torch.no_grad():
                 logits_h = st.history_model(input_ids)
                 history_loss = per_token_ce(logits_h, input_ids)
-            scoring_tokens += int(input_ids.numel())  # history forward only (current folded)
+            scoring_tokens += int(input_ids.numel())
+        elif rho_active or middle_active:
+            current_loss = token_ce.detach()
 
         label_mask = build_mask(
             method=cfg.method,
             k=cfg.k,
             current_loss=current_loss,
             history_loss=history_loss,
+            reference_loss=reference_loss,
             shape_ref=input_ids,
             valid=valid,
             warmup=warmup,
@@ -246,8 +377,14 @@ class TokenSelectLoop:
 
         selected_frac = float(label_mask.float().mean().item())
         mean_kept = mean_dropped = None
-        if current_loss is not None and history_loss is not None:
+        score: Optional[Tensor] = None
+        if rel_active and current_loss is not None and history_loss is not None:
             score = history_loss - current_loss
+        elif rho_active and current_loss is not None and reference_loss is not None:
+            score = current_loss - reference_loss
+        elif middle_active and current_loss is not None:
+            score = current_loss
+        if score is not None:
             kept = label_mask & valid
             dropped = (~label_mask) & valid
             if kept.any():
@@ -259,10 +396,10 @@ class TokenSelectLoop:
         compute = {
             "selected_tokens": int(n_tok),
             "forward_tokens_train": n_input,
-            "forward_tokens_history": n_input if rel_active else 0,
+            "forward_tokens_history": n_input if scoring_forward else 0,
             "forward_tokens_current": 0,  # folded into the training forward
             "fwd_passes_train": 1,
-            "fwd_passes_history": 1 if rel_active else 0,
+            "fwd_passes_history": 1 if scoring_forward else 0,
             "fwd_passes_current": 0,
         }
 
@@ -407,12 +544,13 @@ _EMPTY_SELECTION_DELTA: Dict[str, float] = {
 
 
 class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  # type: ignore[misc]
-    """OLMo-core train module for both full-token and REL+EMA objectives.
+    """OLMo-core train module for full-token, REL+EMA, RHO, and middle-PPL objectives.
 
-    REL uses a no-grad, eval-mode history forward and one grad-enabled current forward
-    whose logits are reused for both current REL loss and the selected-token CE. This
-    gives two forwards per active micro-batch. It intentionally rejects TP/CP and
-    z-loss configurations: their public APIs do not expose unsharded per-token logits
+    REL/RHO use a no-grad scoring forward (EMA history or frozen reference) plus one
+    grad-enabled current forward whose logits are reused for both the current score and
+    the selected-token CE (two forwards per active micro-batch). ``middle_ppl`` reuses
+    the train-forward CE only (one forward). Intentionally rejects TP/CP and z-loss
+    configurations: their public APIs do not expose unsharded per-token logits
     compatible with this scoring path.
     """
 
@@ -438,8 +576,8 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
 
     def _ensure_state(self) -> TokenSelectState:
         if self._ts_state is None:
-            # FSDP-friendly: no deep-copied history module; history forward uses the EMA
-            # shadow swapped into this model (see swap_to below).
+            # FSDP-friendly: no deep-copied history module; scoring forwards use
+            # EMA/FrozenReference.swap_to on this model.
             self._ts_state = TokenSelectState(
                 self.ts_config, self.model, build_history_module=False
             )
@@ -506,8 +644,8 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
         return valid
 
     @staticmethod
-    def _selected_count(valid: Tensor, *, rel_active: bool, k: float) -> int:
-        if not rel_active:
+    def _selected_count(valid: Tensor, *, select_active: bool, k: float) -> int:
+        if not select_active:
             return int(valid.sum().item())
         rows = valid.reshape(-1, valid.shape[-1])
         n_valid = rows.sum(dim=1)
@@ -533,8 +671,8 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
         return logits
 
     @contextlib.contextmanager
-    def _history_eval_mode(self) -> Iterator[None]:
-        """Run the EMA score with dropout disabled, then restore train mode exactly."""
+    def _score_eval_mode(self) -> Iterator[None]:
+        """Run a scoring forward with dropout disabled, then restore train mode exactly."""
         prior_training = self.model.training
         prior_mode = self._model_mode
         self.model.eval()
@@ -563,8 +701,12 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
         input_ids: Tensor = batch["input_ids"]
         warmup = st.in_warmup()
         rel_active = bool(cfg.uses_rel and not warmup)
+        rho_active = bool(cfg.uses_rho and not warmup)
+        middle_active = bool(cfg.uses_middle_ppl and not warmup)
+        select_active = rel_active or rho_active or middle_active
+        scoring_forward = rel_active or rho_active
         valid = self._valid_targets(batch, input_ids)
-        selected_total = self._selected_count(valid, rel_active=rel_active, k=cfg.k)
+        selected_total = self._selected_count(valid, select_active=select_active, k=cfg.k)
         if selected_total == 0:
             raise RuntimeError("TokenSelectTrainModule received a batch with no valid target tokens")
 
@@ -598,9 +740,9 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
         num_micro_batches = len(micro_batches)
         ce_batch_loss = torch.zeros((), device=self.device)
         selected_seen = 0
-        # Accumulated on-device so the REL score curves cost one host sync per batch
+        # Accumulated on-device so the score curves cost one host sync per batch
         # rather than one per micro-batch.
-        rel_sums = torch.zeros(4, device=self.device)
+        score_sums = torch.zeros(4, device=self.device)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
             with self._train_microbatch_context(micro_batch_idx, num_micro_batches):
@@ -609,48 +751,55 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
                 model_kwargs = self._model_kwargs(micro_batch)
 
                 history_loss = None
+                reference_loss = None
                 if rel_active:
                     assert st.ema is not None
-                    with self._history_eval_mode(), torch.no_grad(), st.ema.swap_to(self.model):
+                    with self._score_eval_mode(), torch.no_grad(), st.ema.swap_to(self.model):
                         history_logits = self._forward_logits(micro_input_ids, **model_kwargs)
                         history_loss = per_token_ce(history_logits, micro_input_ids)
-                    # Release the scoring logits before the train forward allocates its
-                    # own. They are the size of the whole [B, T, vocab] tensor, and the
-                    # name would otherwise stay bound for the rest of this iteration.
                     del history_logits
-                    # The history pass is a scoring-only forward, so it must not
-                    # contribute model auxiliary metrics to the training batch.
+                    self.model.reset_auxiliary_metrics()
+                elif rho_active:
+                    assert st.frozen_ref is not None
+                    with self._score_eval_mode(), torch.no_grad(), st.frozen_ref.swap_to(self.model):
+                        ref_logits = self._forward_logits(micro_input_ids, **model_kwargs)
+                        reference_loss = per_token_ce(ref_logits, micro_input_ids)
+                    del ref_logits
                     self.model.reset_auxiliary_metrics()
 
-                # This is the only grad-enabled current-model forward, and its logits are
-                # crossed-entropied once: the per-token CE feeds both the current REL
-                # score (detached) and the selected-token objective below.
                 logits = self._forward_logits(micro_input_ids, **model_kwargs)
                 token_ce = per_token_ce(logits, micro_input_ids)
-                current_loss = token_ce.detach() if rel_active else None
+                current_loss = token_ce.detach() if select_active else None
                 label_mask = build_mask(
                     method=cfg.method,
                     k=cfg.k,
                     current_loss=current_loss,
                     history_loss=history_loss,
+                    reference_loss=reference_loss,
                     shape_ref=micro_input_ids,
                     valid=micro_valid,
                     warmup=warmup,
                 )
                 loss_sum, n_tokens = masked_ce_from_token_ce(token_ce, label_mask)
-                planned = self._selected_count(micro_valid, rel_active=rel_active, k=cfg.k)
+                planned = self._selected_count(micro_valid, select_active=select_active, k=cfg.k)
                 if n_tokens != planned:
                     raise RuntimeError(
                         "token-selection mask count diverged from the planned keep count; "
                         "refusing to apply a mis-scaled gradient"
                     )
                 selected_seen += n_tokens
+                score = None
                 if rel_active and history_loss is not None and current_loss is not None:
                     score = history_loss - current_loss
+                elif rho_active and reference_loss is not None and current_loss is not None:
+                    score = current_loss - reference_loss
+                elif middle_active and current_loss is not None:
+                    score = current_loss
+                if score is not None:
                     kept = label_mask & micro_valid
                     dropped = (~label_mask) & micro_valid
                     zero = torch.zeros((), device=score.device, dtype=score.dtype)
-                    rel_sums += torch.stack(
+                    score_sums += torch.stack(
                         [
                             torch.where(kept, score, zero).sum(),
                             torch.where(dropped, score, zero).sum(),
@@ -669,7 +818,7 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
         self._compute_delta["selected_tokens"] += selected_seen
         self._compute_delta["forward_tokens_train"] += int(batch_num_tokens)
         self._compute_delta["fwd_passes_train"] += num_micro_batches
-        if rel_active:
+        if scoring_forward:
             self._compute_delta["forward_tokens_history"] += int(batch_num_tokens)
             self._compute_delta["fwd_passes_history"] += num_micro_batches
         self.model.post_batch(dry_run=dry_run)
@@ -677,7 +826,7 @@ class TokenSelectTrainModule(TransformerTrainModule if _HAS_OLMO else object):  
             self.model.reset_auxiliary_metrics()
             return
 
-        score_kept, score_dropped, n_kept, n_dropped = rel_sums.tolist()
+        score_kept, score_dropped, n_kept, n_dropped = score_sums.tolist()
         self._selection_delta["rel_score_sum_kept"] += score_kept
         self._selection_delta["rel_score_sum_dropped"] += score_dropped
         self._selection_delta["n_kept"] += n_kept
@@ -700,7 +849,7 @@ def has_olmo_core() -> bool:
 def make_ts_config(
     cfg: Dict[str, Any],
     *,
-    method: Literal["full", "rel_ema"],
+    method: Literal["full", "rel_ema", "rho_excess", "middle_ppl"],
     total_steps: Optional[int] = None,
     t0_steps: Optional[int] = None,
 ) -> TokenSelectConfig:
@@ -709,12 +858,16 @@ def make_ts_config(
         from token_selection.scripts import derive_steps
 
         total_steps, t0_steps = derive_steps(cfg)
+    uses_selection = method in ("rel_ema", "rho_excess", "middle_ppl")
+    ref = cfg.get("reference") or {}
+    ref_path = ref.get("load_path")
     return TokenSelectConfig(
         method=method,
         k=float(cfg.get("k", 0.6)),
-        t0_steps=int(t0_steps) if method == "rel_ema" else 0,
+        t0_steps=int(t0_steps) if uses_selection else 0,
         total_steps=int(total_steps),
         alpha_start=float(cfg.get("alpha_start", 0.999)),
         alpha_end=float(cfg.get("alpha_end", 0.995)),
         seed=int(cfg.get("seed", 42)),
+        reference_load_path=str(ref_path) if ref_path else None,
     )

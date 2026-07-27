@@ -187,6 +187,30 @@ def test_state_without_history_module_uses_swap():
     assert logits.shape[-1] == 32
 
 
+def test_middle_ppl_warmup_then_select_no_scoring_forward():
+    torch.manual_seed(0)
+    model = Tiny()
+    cfg = TokenSelectConfig(method="middle_ppl", k=0.6, t0_steps=2, total_steps=6, seed=0)
+    loop = TokenSelectLoop(model, cfg)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    fracs = []
+    for _ in range(6):
+        x = torch.randint(1, 32, (2, 16))
+        out = loop.train_step(x)
+        opt.zero_grad()
+        out["loss"].backward()
+        opt.step()
+        loop.optim_step_done()
+        fracs.append(out["selected_frac"])
+        assert out["loss"].isfinite()
+        assert out["scoring_tokens"] == 0
+        assert out["compute"]["forward_tokens_history"] == 0
+        assert out["method"] == "middle_ppl"
+    assert fracs[0] > 0.9
+    assert fracs[1] > 0.9
+    assert 0.4 < fracs[-1] < 0.8
+
+
 def test_relcallback_importable_without_olmo():
     assert has_olmo_core() is False
     cb = RELCallback()

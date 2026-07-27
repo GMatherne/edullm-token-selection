@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Train ``full`` or ``rel_ema`` on an identical local stream.
+"""Train ``full``, ``rel_ema``, ``rho_excess``, or ``middle_ppl`` on an identical local stream.
 
-The local path is a two-arm plumbing check: both methods start from the same
-TinyLM weights and consume the same frozen full training stream (no held-out
-carve-out). Production training is delegated to ``train_olmo_template``.
+The local path is a plumbing check: methods start from the same TinyLM init
+recipe and consume the same frozen full training stream (no held-out carve-out).
+Production training is delegated to ``train_olmo_template``.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from token_selection.olmo_ext.frozen_ref import FrozenReference
 from token_selection.olmo_ext.metrics import (
     MetricLogger,
     StepMetrics,
@@ -38,7 +39,8 @@ from token_selection.olmo_ext.train_module import (
 from token_selection.scripts import derive_steps, load_config, resolve_output_dir
 from token_selection.scripts.experiment_contract import validate_scratch_config
 
-MethodName = Literal["full", "rel_ema"]
+MethodName = Literal["full", "rel_ema", "rho_excess", "middle_ppl"]
+_SELECTING = ("rel_ema", "rho_excess", "middle_ppl")
 
 
 class TinyLM(nn.Module):
@@ -71,7 +73,15 @@ def run_local_smoke(cfg: dict, out: Path, method: MethodName) -> Path:
     order_id = str(order_manifest["order_contract"]["contract_sha256"])
 
     t0_frac = float(cfg.get("t0_frac", 0.02))
-    t0_steps = max(1, int(round(steps * t0_frac))) if method == "rel_ema" else 0
+    t0_steps = max(1, int(round(steps * t0_frac))) if method in _SELECTING else 0
+
+    frozen_ref = None
+    if method == "rho_excess":
+        # Distinct in-memory twin so excess loss is not identically zero.
+        torch.manual_seed(seed + 1)
+        ref_model = TinyLM(vocab)
+        frozen_ref = FrozenReference.from_module(ref_model)
+        torch.manual_seed(seed)
 
     model = TinyLM(vocab)
     ts_cfg = TokenSelectConfig(
@@ -83,7 +93,7 @@ def run_local_smoke(cfg: dict, out: Path, method: MethodName) -> Path:
         alpha_end=float(cfg["alpha_end"]),
         seed=seed,
     )
-    loop = TokenSelectLoop(model, ts_cfg)
+    loop = TokenSelectLoop(model, ts_cfg, frozen_ref=frozen_ref)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
     ckpt_dir = out / "checkpoints" / method
@@ -183,15 +193,27 @@ def run_local_smoke(cfg: dict, out: Path, method: MethodName) -> Path:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, default=ROOT / "token_selection/configs/run_smoke.yaml")
-    ap.add_argument("--method", choices=["full", "rel_ema"], default=None)
+    ap.add_argument(
+        "--method",
+        choices=["full", "rel_ema", "rho_excess", "middle_ppl"],
+        default=None,
+    )
     ap.add_argument("--mode", choices=["auto", "local", "olmo"], default="auto")
     args = ap.parse_args()
     cfg = load_config(args.config)
     out = resolve_output_dir(cfg, ROOT)
-    validate_scratch_config(cfg)
+    methods = cfg.get("methods") or []
+    if args.method:
+        method: MethodName = args.method  # type: ignore[assignment]
+    elif "middle_ppl" in methods and len(methods) == 1:
+        method = "middle_ppl"
+    elif "rho_excess" in methods:
+        method = "rho_excess"
+    else:
+        method = "rel_ema"
+    validate_scratch_config(cfg, method=method)
 
-    method: MethodName = args.method or "rel_ema"
-    allowed = cfg.get("methods") or ["full", "rel_ema"]
+    allowed = cfg.get("methods") or ["full", "rel_ema", "rho_excess", "middle_ppl"]
     if method not in allowed:
         raise SystemExit(f"method {method!r} not in config methods {allowed}")
 

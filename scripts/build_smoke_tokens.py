@@ -22,7 +22,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from token_selection.olmo_ext.token_io import (  # noqa: E402
-    MASK_DTYPE,
     TOKEN_DTYPE,
     dtype_name,
     write_token_array,
@@ -49,6 +48,8 @@ def main() -> None:
     tokens_dir = out / "tokens"
     tokens_dir.mkdir(parents=True, exist_ok=True)
     # Shards from an earlier build would read as stray files the manifest does not list.
+    # Also clear legacy labels_mask_*.npy: validate_token_manifest treats every *.npy as a
+    # token shard, and the local smoke harness never reads those masks.
     for stale in (*tokens_dir.glob("tokens_*.npy"), *tokens_dir.glob("labels_mask_*.npy")):
         stale.unlink()
 
@@ -57,12 +58,6 @@ def main() -> None:
     shard_name = "tokens_0000.npy"
     n_tokens = write_token_array(tokens_dir / shard_name, flat, dtype=TOKEN_DTYPE)
 
-    # All-True label mask (online selection overrides during training)
-    mask_name = "labels_mask_0000.npy"
-    write_token_array(
-        tokens_dir / mask_name, np.ones_like(flat, dtype=MASK_DTYPE), dtype=MASK_DTYPE
-    )
-
     meta = {
         "n_tokens": n_tokens,
         "dtype": dtype_name(TOKEN_DTYPE),
@@ -70,13 +65,13 @@ def main() -> None:
         "vocab_size": vocab,
         "n_docs": n_docs,
         "shards": [
-            {"path": shard_name, "label_mask_path": mask_name, "n_tokens": n_tokens},
+            {"path": shard_name, "n_tokens": n_tokens},
         ],
         "synthetic": True,
         "seed": seed,
     }
     (tokens_dir / "manifest.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"Wrote {tokens_dir / shard_name} ({n_tokens} tokens) and mask -> {tokens_dir}")
+    print(f"Wrote {tokens_dir / shard_name} ({n_tokens} tokens) -> {tokens_dir}")
 
 
 if __name__ == "__main__":

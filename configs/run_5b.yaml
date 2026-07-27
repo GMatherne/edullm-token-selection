@@ -55,7 +55,8 @@ train:
   rank_microbatch_size: 65536
   # torch.compile via OLMo-core TransformerTrainModuleConfig.compile_model.
   compile_model: true
-  cuda_visible_devices: "7"
+  # Host-specific; not part of scientific identity. Required at --launch.
+  cuda_visible_devices: ""
   num_workers: 8
   # T0 = 24. Permanent + final (post_train) checkpoints kept for resume/eval.
   checkpoint_every_steps: 250

@@ -63,14 +63,42 @@ def test_full_and_rel_share_frozen_data_and_emit_train_metrics(tmp_path):
 
     full_path = run_local_smoke(cfg, out, "full")
     rel_path = run_local_smoke(cfg, out, "rel_ema")
+    rho_path = run_local_smoke(cfg, out, "rho_excess")
+    mid_path = run_local_smoke(cfg, out, "middle_ppl")
     full = json.loads(full_path.read_text(encoding="utf-8"))
     rel = json.loads(rel_path.read_text(encoding="utf-8"))
+    rho = json.loads(rho_path.read_text(encoding="utf-8"))
+    mid = json.loads(mid_path.read_text(encoding="utf-8"))
 
-    assert full["experiment"] == rel["experiment"]
+    assert full["experiment"] == rel["experiment"] == rho["experiment"] == mid["experiment"]
     assert "validation" not in full
     assert "validation" not in rel
     assert full["compute"]["forward_tokens_train"] == rel["compute"]["forward_tokens_train"]
     assert rel["compute"]["forward_tokens_history"] > 0
+    assert rho["compute"]["forward_tokens_history"] > 0
+    # middle_ppl reuses train-forward CE; no second scoring forward.
+    assert mid["compute"]["forward_tokens_history"] == 0
     assert len(full["train_loss_curve"]) == len(rel["train_loss_curve"]) > 0
+    assert len(rho["train_loss_curve"]) == len(full["train_loss_curve"])
+    assert len(mid["train_loss_curve"]) == len(full["train_loss_curve"])
     assert (out / "checkpoints" / "full" / "last.pt").exists()
     assert (out / "checkpoints" / "rel_ema" / "last.pt").exists()
+    assert (out / "checkpoints" / "rho_excess" / "last.pt").exists()
+    assert (out / "checkpoints" / "middle_ppl" / "last.pt").exists()
+    # Online evidence that excess-loss selection is separating tokens.
+    rho_rows = [r for r in rho["selection_curve"] if not r.get("warmup")]
+    assert rho_rows
+    assert all(
+        r.get("mean_rel_kept") is not None
+        and r.get("mean_rel_dropped") is not None
+        and r["mean_rel_kept"] >= r["mean_rel_dropped"]
+        for r in rho_rows
+    )
+    mid_rows = [r for r in mid["selection_curve"] if not r.get("warmup")]
+    assert mid_rows
+    assert all(
+        r.get("mean_rel_kept") is not None
+        and r.get("mean_rel_dropped") is not None
+        and 0.3 < float(r["selected_frac"]) < 0.7
+        for r in mid_rows
+    )
